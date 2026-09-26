@@ -1,0 +1,80 @@
+#version 460
+// aliceai depth-residual softmax mixing (Op::AttnResMix). One workgroup owns one token row and
+// reduces over the channel axis; `srcs` is the `[n_src, rows, ne]` source-major stack, `score` the
+// `[ne]` mixing projection. Per source: `rms = sqrt(mean_c(x^2)+eps)`, `sc = <score,x>/rms`; then
+// `dst = sum_s softmax_s(sc) * srcs_s`.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define MAX_SRC 64u
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint n_src;
+    uint ne;
+    float eps;
+} pc;
+
+layout(binding = 0) readonly buffer SRC { float srcs[]; };   // [n_src, rows, ne]
+layout(binding = 1) readonly buffer SCO { float score[]; };  // [ne]
+layout(binding = 2) buffer DST { float dst[]; };             // [rows, ne]
+
+shared float red[256];
+shared float ss[MAX_SRC];
+shared float dts[MAX_SRC];
+shared float wt[MAX_SRC];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+
+    for (uint s = 0u; s < pc.n_src; s++) {
+        uint sb = (s * pc.rows + row) * pc.ne;
+        float lss = 0.0;
+        float ldt = 0.0;
+        for (uint c = lane; c < pc.ne; c += 256u) {
+            float x = srcs[sb + c];
+            lss += x * x;
+            ldt += score[c] * x;
+        }
+        red[lane] = lss;
+        barrier();
+        for (uint st = 128u; st > 0u; st >>= 1u) {
+            if (lane < st) { red[lane] += red[lane + st]; }
+            barrier();
+        }
+        if (lane == 0u) { ss[s] = red[0]; }
+        barrier();
+        red[lane] = ldt;
+        barrier();
+        for (uint st = 128u; st > 0u; st >>= 1u) {
+            if (lane < st) { red[lane] += red[lane + st]; }
+            barrier();
+        }
+        if (lane == 0u) { dts[s] = red[0]; }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        float mx = -3.4e38;
+        for (uint s = 0u; s < pc.n_src; s++) {
+            float rms = sqrt(ss[s] / float(pc.ne) + pc.eps);
+            float sc = (rms > 0.0) ? dts[s] / rms : 0.0;
+            wt[s] = sc;
+            if (sc > mx) { mx = sc; }
+        }
+        float sum = 0.0;
+        for (uint s = 0u; s < pc.n_src; s++) { wt[s] = exp(wt[s] - mx); sum += wt[s]; }
+        float inv = (sum > 0.0) ? (1.0 / sum) : 0.0;
+        for (uint s = 0u; s < pc.n_src; s++) { wt[s] *= inv; }
+    }
+    barrier();
+
+    uint dbase = row * pc.ne;
+    for (uint c = lane; c < pc.ne; c += 256u) {
+        float acc = 0.0;
+        for (uint s = 0u; s < pc.n_src; s++) {
+            acc += wt[s] * srcs[(s * pc.rows + row) * pc.ne + c];
+        }
+        dst[dbase + c] = acc;
+    }
+}

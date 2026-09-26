@@ -185,6 +185,7 @@ Prompt 为实际输入 token 数；Prefill 与 Decode 的单位均为 tok/s。
 | Gemma 3 / Gemma 4       | `gemma3`、`gemma4`             | Dense、MoE 与 E2B 变体                                                |
 | Ling 3.0 Flash          | `bailingmoe3`                    | KDA、gated MLA、512 experts 与 RAM/SSD 分页                           |
 | DeepSeek V4 Flash       | `deepseek4`                      | FP8 KV、MXFP4 indexer cache 与分页 MoE                                |
+| Yandex AliceAI-Foundation | `aliceai`                      | 周期 4 KDA/全注意力、深度残差 softmax 混合与分页 MoE                  |
 | DiffusionGemma          | `diffusion-gemma`                | 文本扩散推理                                                          |
 | Embedding GGUF          | 受支持的 Embedding 架构            | 原生 CPU/Vulkan OpenAI Embedding API                                  |
 

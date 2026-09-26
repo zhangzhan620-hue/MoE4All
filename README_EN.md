@@ -211,6 +211,7 @@ context, automatic profile or launch command, and Prefill/Decode speeds.
 | Gemma 3 / Gemma 4 | `gemma3`, `gemma4` | Dense, MoE, and E2B variants |
 | Ling 3.0 Flash | `bailingmoe3` | KDA, gated MLA, 512 experts, and RAM/SSD paging |
 | DeepSeek V4 Flash | `deepseek4` | FP8 KV, MXFP4 indexer cache, and paged MoE |
+| Yandex AliceAI-Foundation | `aliceai` | Period-4 KDA/full-attention, depth-residual softmax mixing, and paged MoE |
 | DiffusionGemma | `diffusion-gemma` | Text-diffusion inference |
 | Embedding GGUFs | Supported embedding architectures | Native CPU/Vulkan OpenAI Embedding API |
 

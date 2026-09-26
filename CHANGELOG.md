@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Yandex AliceAI-Foundation (`aliceai`) support: config and GGUF loader, depth-residual softmax
+  mixing via `Op::AttnResMix`, the KDA softplus log-decay mode on `Op::Kda`, CPU and Vulkan kernels
+  for both, and the synthetic `synthetic_aliceai_generates` test plus its Vulkan twin. Metal is not
+  implemented.
+
 ## [0.7.0] - 2026-09-20
 
 ### Highlights

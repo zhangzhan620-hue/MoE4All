@@ -199,6 +199,72 @@ impl Finish {
     }
 }
 
+/// Architecture-gated output shaping for a chat generator. It is DECIDED by the generator (the only
+/// component that knows the model/config it is serving) and APPLIED by the server.
+///
+/// It exists so a BASE model with a non-chat output format can be made to behave like a chat model
+/// at the wire layer WITHOUT touching every other model: every field defaults to "do nothing", and
+/// [`ChatGenerator::output_policy`]'s default returns exactly that. See [`aliceai_output_policy`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChatOutputPolicy {
+    /// Stop sequences the server ADDS to the request's own `stop` list before generation. They are
+    /// APPENDED (never replace the request's) and de-duplicated, so a request that set its own stop
+    /// still gets these — they encode the MODEL's turn boundary, not a user preference.
+    pub extra_stop: Vec<String>,
+    /// Hide the segment between `[COT_START]` and `[COT_END]` from the emitted assistant text.
+    pub strip_cot: bool,
+    /// Default `presence_penalty` for this arch, applied ONLY when the request did not specify one.
+    /// `None` = no arch default (every existing generator). See [`aliceai_output_policy`].
+    pub default_presence_penalty: Option<f32>,
+    /// Default `frequency_penalty` for this arch, applied ONLY when the request did not specify one.
+    pub default_frequency_penalty: Option<f32>,
+    /// Default llama.cpp `repeat_penalty` for this arch, applied ONLY when the request did not
+    /// specify one.
+    pub default_repeat_penalty: Option<f32>,
+}
+
+/// The output policy for the `aliceai` base model (Yandex AliceAI-Foundation). It emits a
+/// `[COT_START]…[COT_END]` chain-of-thought and never emits an end-of-turn token, so the server
+/// stops at the next user turn the model would otherwise start generating.
+///
+/// The CoT segment is SHOWN by default — the harness renders it as live `reasoning_content`
+/// instead of a UI that looks stuck while a long trace is generated. Set `INFR_ALICEAI_STRIP_COT`
+/// to any non-empty value other than `"0"` to hide it again (the codebase's presence grammar:
+/// unset, empty, or `"0"` = show; anything else = strip). Only affects `aliceai`;
+/// `aliceai == false` is [`ChatOutputPolicy::default`] — every other arch unchanged.
+///
+/// A free function rather than a `ParallelSeam` method so it is unit-testable without a live Vulkan
+/// device; `ParallelGenerator::output_policy` calls it with the model's `aliceai` flag.
+pub fn aliceai_output_policy(aliceai: bool) -> ChatOutputPolicy {
+    if aliceai {
+        ChatOutputPolicy {
+            // Turn boundary (the model would otherwise keep writing into a hallucinated next turn)
+            // plus the RL-training self-evaluation tail this base model leaks after its answer
+            // ("My decisions are incorrect, reward is 0.0.") — it carries NO turn separator, so the
+            // user-turn stop alone never fires. Both are model-specific strings; they only apply to
+            // `aliceai`.
+            extra_stop: vec![
+                "\n\n user:".to_string(),
+                "\n\nuser:".to_string(),
+                "My decisions are incorrect".to_string(),
+                "\n\nMy decisions".to_string(),
+                "\n\nReward:".to_string(),
+                "\nReward:".to_string(),
+            ],
+            strip_cot: std::env::var_os("INFR_ALICEAI_STRIP_COT")
+                .is_some_and(|v| !v.is_empty() && v != "0"),
+            // The author's own evaluation used `presence_penalty=1.5`; without a penalty this base
+            // model loops. Applied only when the request leaves the field absent (see the handler),
+            // so an explicit client value still wins.
+            default_presence_penalty: Some(1.0),
+            default_frequency_penalty: None,
+            default_repeat_penalty: Some(1.1),
+        }
+    } else {
+        ChatOutputPolicy::default()
+    }
+}
+
 /// Generation backend the server drives — it never knows the model/GPU underneath. Implemented by
 /// the CLI's per-arch adapters (`infr-cli`'s `ParallelGenerator` over `infr_llama::ParallelSeam` for
 /// the Vulkan seam; `SeamGenerator` wraps any `infr_llama::ChatModel` for the rest, including
@@ -240,6 +306,14 @@ pub trait ChatGenerator: Send + Sync {
         progress: Option<infr_core::GenerationProgressCallback>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<ChatOutcome>;
+
+    /// Output shaping this generator wants applied to its replies (extra stop sequences, CoT
+    /// hiding). DEFAULT: nothing — a generator that does not override this is byte-identical to
+    /// before the method existed. The server calls it once per request and applies the result; see
+    /// [`ChatOutputPolicy`].
+    fn output_policy(&self) -> ChatOutputPolicy {
+        ChatOutputPolicy::default()
+    }
 }
 
 /// Embedding backend driven by `/v1/embeddings`. Like [`ChatGenerator`], the server knows
@@ -335,6 +409,10 @@ pub struct GenParams {
     pub repeat_penalty: Option<f32>,
     /// Already normalised: empty strings dropped (an empty stop would fire on the first token).
     pub stop: Vec<String>,
+    /// Hide a `[COT_START]…[COT_END]` reasoning segment from the emitted assistant text. Set by the
+    /// server from the generator's [`ChatOutputPolicy::strip_cot`]; `false` for every normal
+    /// request, so a request that never goes through that path is unchanged.
+    pub strip_cot: bool,
 }
 
 /// An OpenAI-shaped 400: `{"error":{"message":..,"type":"invalid_request_error","param":..}}`.
@@ -446,6 +524,7 @@ impl GenParams {
             frequency_penalty: rng("frequency_penalty", req.frequency_penalty, -2.0, 2.0)?,
             repeat_penalty: req.repeat_penalty,
             stop,
+            strip_cot: false,
         })
     }
 }
@@ -560,6 +639,111 @@ impl StopMatcher {
         }
         0
     }
+}
+
+/// The `[COT_START]` marker that opens a chain-of-thought segment.
+pub const COT_START: &str = "[COT_START]";
+/// The `[COT_END]` marker that closes a chain-of-thought segment.
+pub const COT_END: &str = "[COT_END]";
+
+/// Incremental filter that REMOVES a `[COT_START]…[COT_END]` reasoning segment from the decoded
+/// text stream, emitting only the text outside it. A sibling of [`StopMatcher`] built the same way:
+/// it holds back a bounded tail so a marker split across token boundaries is never partially
+/// emitted, then drops the whole segment (markers included).
+///
+/// **Order at the call site: this runs BEFORE [`StopMatcher`].** That way the stop matcher and the
+/// client see only VISIBLE answer text: a `\n\nuser:` stop inside the hidden reasoning cannot fire
+/// early, and no hidden byte is ever held by the stop matcher. `finish()` emits any held non-CoT
+/// tail and DROPS an unterminated CoT tail (the model was still reasoning when the budget ran out —
+/// that partial reasoning is not an answer and must not surface).
+#[derive(Debug)]
+pub struct CotFilter {
+    /// Decoded text not yet classified; a possible marker prefix is at the end of this.
+    buf: String,
+    in_cot: bool,
+}
+
+impl Default for CotFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CotFilter {
+    pub fn new() -> Self {
+        Self {
+            buf: String::new(),
+            in_cot: false,
+        }
+    }
+
+    /// Feed one decoded piece; returns the VISIBLE text that is now safe to emit (possibly empty).
+    pub fn push(&mut self, piece: &str) -> String {
+        self.buf.push_str(piece);
+        let mut out = String::new();
+        loop {
+            if self.in_cot {
+                match self.buf.find(COT_END) {
+                    Some(pos) => {
+                        // Drop the hidden segment AND its closing marker.
+                        self.buf.drain(..pos + COT_END.len());
+                        self.in_cot = false;
+                    }
+                    None => {
+                        // Hold only a possible `[COT_END]` prefix; the rest stays hidden.
+                        let hold = partial_suffix_len(&self.buf, COT_END);
+                        let cut = self.buf.len() - hold;
+                        self.buf.drain(..cut);
+                        break;
+                    }
+                }
+            } else {
+                match self.buf.find(COT_START) {
+                    Some(pos) => {
+                        out.push_str(&self.buf[..pos]);
+                        self.buf.drain(..pos + COT_START.len());
+                        self.in_cot = true;
+                    }
+                    None => {
+                        // Emit everything but a possible `[COT_START]` prefix.
+                        let hold = partial_suffix_len(&self.buf, COT_START);
+                        let cut = self.buf.len() - hold;
+                        out.push_str(&self.buf[..cut]);
+                        self.buf.drain(..cut);
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// End of generation: emit any held non-CoT tail; drop an unterminated CoT tail.
+    pub fn finish(&mut self) -> String {
+        if self.in_cot {
+            self.buf.clear();
+            String::new()
+        } else {
+            std::mem::take(&mut self.buf)
+        }
+    }
+}
+
+/// Length (bytes) of the longest suffix of `buf` that is a proper PREFIX of `needle`. Always lands
+/// on a char boundary: a suffix equal to `needle[..n]` starts at `needle`'s first byte, a UTF-8
+/// lead byte.
+fn partial_suffix_len(buf: &str, needle: &str) -> usize {
+    let max = needle.len().saturating_sub(1).min(buf.len());
+    for n in (1..=max).rev() {
+        let start = buf.len() - n;
+        if !buf.is_char_boundary(start) {
+            continue;
+        }
+        if needle.as_bytes().starts_with(&buf.as_bytes()[start..]) {
+            return n;
+        }
+    }
+    0
 }
 
 /// Normalise OpenAI `tool_choice` to a string the generator understands: `"auto"`/`"required"`/
@@ -2394,6 +2578,28 @@ async fn embeddings_handler(
     }
 }
 
+/// Apply a generator's [`ChatOutputPolicy`] to this request's [`GenParams`].
+///
+/// * Its model-specific `extra_stop` sequences are APPENDED (never replacing the request's) and
+///   de-duplicated — they encode the MODEL's turn boundary, not a user preference.
+/// * Its arch-default penalties fill in ONLY where the request was absent (`Option::or` leaves a
+///   present request value — including an explicit `0`/`1.0` — untouched). This is where the
+///   `aliceai` repetition default reaches the sampler: the `GenParams` fields are mapped 1:1 onto
+///   `infr_llama::sampling::RequestSampling` by the CLI's `request_sampling`.
+fn apply_output_policy(params: &mut GenParams, policy: &ChatOutputPolicy) {
+    for stop in &policy.extra_stop {
+        if !stop.is_empty() && !params.stop.contains(stop) {
+            params.stop.push(stop.clone());
+        }
+    }
+    params.strip_cot = policy.strip_cot;
+    params.presence_penalty = params.presence_penalty.or(policy.default_presence_penalty);
+    params.frequency_penalty = params
+        .frequency_penalty
+        .or(policy.default_frequency_penalty);
+    params.repeat_penalty = params.repeat_penalty.or(policy.default_repeat_penalty);
+}
+
 async fn chat_completions_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2443,6 +2649,17 @@ async fn chat_completions_handler(
     // client that omitted/mis-named the model sees which one answered.
     let entry = state.route(&req.model);
     let model_id = entry.id.to_string();
+    // Architecture-gated output shaping (see [`ChatOutputPolicy`]). Decided by the generator — the
+    // only thing that knows the model it is serving — and applied HERE so both the streaming and
+    // non-streaming paths get it for free. Extra stops are APPENDED to (never replace) the
+    // request's own stops and de-duplicated: a request that set its own `stop` still gets these,
+    // because they encode the MODEL's turn boundary rather than a user preference.
+    let policy = entry
+        .engine
+        .as_ref()
+        .map(|e| e.output_policy())
+        .unwrap_or_default();
+    apply_output_policy(&mut params, &policy);
     let ctx = ReqCtx {
         id: next_req_id(),
         cid: make_id(),
@@ -4414,6 +4631,188 @@ mod tests {
         assert!(m.hit());
         assert_eq!(m.push("more"), "");
         assert_eq!(m.flush(), "");
+    }
+
+    // --- CotFilter: hidden reasoning segment --------------------------------
+
+    /// Drive a filter over a token sequence, returning the visible text (streaming + finish).
+    fn run_cot(pieces: &[&str]) -> String {
+        let mut f = CotFilter::new();
+        let mut out = String::new();
+        for p in pieces {
+            out.push_str(&f.push(p));
+        }
+        out.push_str(&f.finish());
+        out
+    }
+
+    #[test]
+    fn cot_markers_within_one_piece_are_hidden() {
+        let out = run_cot(&[
+            "hello ",
+            "[COT_START]secret reasoning[COT_END]",
+            "world",
+        ]);
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn cot_start_split_across_tokens_never_leaks_partial_marker() {
+        // "[COT_START]" arrives as "[", "COT_", "START]"; no partial prefix may leak, and the
+        // whole reasoning segment plus its (split) closing marker must be dropped.
+        let out = run_cot(&[
+            "answer",
+            "[",
+            "COT_",
+            "START]",
+            "hidden",
+            "[COT",
+            "_END]",
+            "done",
+        ]);
+        assert_eq!(out, "answerdone");
+    }
+
+    #[test]
+    fn cot_end_split_mid_marker_is_hidden() {
+        let out = run_cot(&["a", "[COT_START]reaso", "ning[COT_", "END]", "b"]);
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn cot_unterminated_tail_is_dropped_at_finish() {
+        let out = run_cot(&["visible ", "[COT_START]still thinking"]);
+        assert_eq!(out, "visible ");
+    }
+
+    #[test]
+    fn cot_absent_is_a_passthrough() {
+        let out = run_cot(&["plain ", "answer ", "text"]);
+        assert_eq!(out, "plain answer text");
+    }
+
+    #[test]
+    fn cot_partial_marker_prefix_that_never_completes_is_emitted() {
+        // "[COT" at the end with no completion was ordinary text, not a marker: it must surface.
+        let out = run_cot(&["hello [COT"]);
+        assert_eq!(out, "hello [COT");
+    }
+
+    #[test]
+    fn cot_multiple_segments_all_hidden() {
+        let out = run_cot(&["a[COT_START]x[COT_END]b[COT_START]y[COT_END]c"]);
+        assert_eq!(out, "abc");
+    }
+
+    // --- aliceai output policy ----------------------------------------------
+
+    /// The environment is process-wide, so tests that set `INFR_ALICEAI_STRIP_COT` serialize on
+    /// this lock and remove the variable before releasing it.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn aliceai_policy_only_when_flag_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFR_ALICEAI_STRIP_COT");
+        let on = aliceai_output_policy(true);
+        // CoT is SHOWN by default; `aliceai_strip_cot_env_toggle` proves the env can strip it.
+        assert!(!on.strip_cot);
+        assert_eq!(
+            on.extra_stop,
+            vec![
+                "\n\n user:".to_string(),
+                "\n\nuser:".to_string(),
+                "My decisions are incorrect".to_string(),
+                "\n\nMy decisions".to_string(),
+                "\n\nReward:".to_string(),
+                "\nReward:".to_string(),
+            ]
+        );
+        let off = aliceai_output_policy(false);
+        assert_eq!(off, ChatOutputPolicy::default());
+        assert!(!off.strip_cot);
+        assert!(off.extra_stop.is_empty());
+        // The arch default penalties exist only on the `true` side; `false` is all-`None`, so a
+        // non-aliceai generator is byte-identical to before the fields existed.
+        assert_eq!(on.default_presence_penalty, Some(1.0));
+        assert_eq!(on.default_repeat_penalty, Some(1.1));
+        assert_eq!(on.default_frequency_penalty, None);
+        assert_eq!(off.default_presence_penalty, None);
+        assert_eq!(off.default_repeat_penalty, None);
+        assert_eq!(off.default_frequency_penalty, None);
+    }
+
+    /// `INFR_ALICEAI_STRIP_COT` uses the codebase's presence grammar: a non-empty value that is
+    /// not `"0"` strips the CoT; `"0"` and empty leave it SHOWN (the default). Serialized on
+    /// `ENV_LOCK` with the default test, and the variable is removed before the guard is released.
+    #[test]
+    fn aliceai_strip_cot_env_toggle() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        std::env::set_var("INFR_ALICEAI_STRIP_COT", "1");
+        assert!(aliceai_output_policy(true).strip_cot);
+        // Presence, not boolean parsing: any non-`"0"` value means ON.
+        std::env::set_var("INFR_ALICEAI_STRIP_COT", "true");
+        assert!(aliceai_output_policy(true).strip_cot);
+        // `"0"` is the explicit OFF in the presence grammar.
+        std::env::set_var("INFR_ALICEAI_STRIP_COT", "0");
+        assert!(!aliceai_output_policy(true).strip_cot);
+        // Empty is OFF too.
+        std::env::set_var("INFR_ALICEAI_STRIP_COT", "");
+        assert!(!aliceai_output_policy(true).strip_cot);
+
+        // The toggle never affects a non-aliceai arch.
+        std::env::set_var("INFR_ALICEAI_STRIP_COT", "1");
+        assert!(!aliceai_output_policy(false).strip_cot);
+
+        std::env::remove_var("INFR_ALICEAI_STRIP_COT");
+    }
+
+    // --- aliceai penalty defaults reach GenParams ---------------------------
+
+    #[test]
+    fn aliceai_default_penalties_fill_only_absent_request_fields() {
+        // (1) Request says nothing -> the aliceai defaults are filled in, exactly where the sampler
+        // reads them (`request_sampling` maps these `GenParams` fields 1:1 to `RequestSampling`).
+        let mut p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .unwrap();
+        apply_output_policy(&mut p, &aliceai_output_policy(true));
+        assert_eq!(p.presence_penalty, Some(1.0));
+        assert_eq!(p.repeat_penalty, Some(1.1));
+        assert_eq!(p.frequency_penalty, None);
+
+        // (2) Request set its own values -> the default must NOT override them.
+        let mut p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"presence_penalty":0.25,"repeat_penalty":1.4}"#,
+        ))
+        .unwrap();
+        apply_output_policy(&mut p, &aliceai_output_policy(true));
+        assert_eq!(p.presence_penalty, Some(0.25));
+        assert_eq!(p.repeat_penalty, Some(1.4));
+        assert_eq!(p.frequency_penalty, None);
+
+        // (2b) An EXPLICIT `0`/`1.0` (penalty off) is still "the user spoke" and is preserved.
+        let mut p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"presence_penalty":0,"repeat_penalty":1.0}"#,
+        ))
+        .unwrap();
+        apply_output_policy(&mut p, &aliceai_output_policy(true));
+        assert_eq!(p.presence_penalty, Some(0.0));
+        assert_eq!(p.repeat_penalty, Some(1.0));
+
+        // (3) Non-aliceai -> no default at all; the request is left byte-identical.
+        let mut p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .unwrap();
+        let before = p.clone();
+        apply_output_policy(&mut p, &aliceai_output_policy(false));
+        assert_eq!(p, before);
+        assert_eq!(p.presence_penalty, None);
+        assert_eq!(p.repeat_penalty, None);
+        assert_eq!(p.frequency_penalty, None);
     }
 
     // --- finish_reason ------------------------------------------------------

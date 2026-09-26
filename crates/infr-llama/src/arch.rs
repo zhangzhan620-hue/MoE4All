@@ -104,6 +104,32 @@ pub const DEEPSEEK32: &str = "deepseek32";
 /// The LOAD path is complete — config, every tensor — and nothing emits it yet, so a graph build
 /// refuses this arch. See docs/deepseek.md § Stage 4.
 pub const DEEPSEEK4: &str = "deepseek4";
+/// Yandex AliceAI-Foundation (`general.architecture = "aliceai"`, e.g. 80B-A3B). A hybrid
+/// recurrent/attention MoE whose per-layer graph is NOT the shared transformer skeleton:
+///
+/// * **Period-4 token mixers** — every 4th layer (`(il+1) % 4 == 0`, flagged per-layer by the
+///   `attention.head_count_kv` ARRAY: 0 = recurrent, 2 = full attention) is GQA full attention
+///   (16 q heads, 2 kv heads, hd=256) with zero-centered q/k RMSNorm and partial NEOX rope over
+///   the first 64 dims (`rope.dimension_count`, theta 1e6), and a per-head output gate interleaved
+///   in `attn_q` (`[h q(256) | h gate(256) | …]`, sigmoid before `o_proj`). The other three layers
+///   run a **KDA** (Kimi delta-rule) recurrent mixer with depthwise q/k/v conv (kernel 4, SiLU)
+///   and a SOFTPLUS log-decay: `decay[h,k] = exp(ssm_a[h] * softplus(alpha[h,k] + dt_bias[h,k]))`,
+///   where the GGUF's `ssm_a` already holds the converter-prepared `-exp(A_log)` (`conversion.json`:
+///   "transform KDA log-decay parameter") — the op multiplies it in directly, with no re-exp.
+///   This differs from Ling's `exp(lower_bound*sigmoid(...))` form, hence the `softplus` mode added
+///   to [`infr_core::graph::Op::Kda`].
+/// * **Depth residual softmax mixing** (`_depth_softmax_mix`): there is no plain residual stream.
+///   A growing list of "completed block" residuals (one per 4 layers) plus a running `partial`
+///   is mixed by a per-row softmax over sources, where each source's score is a weightless RMSNorm
+///   dotted with a learned `[n_embd]` vector. The converter folds the per-source norm weight INTO
+///   that vector (`res_score = res_proj ⊙ res_norm_weight`), so the op normalizes weightlessly.
+///   See [`infr_core::graph::Op::AttnResMix`].
+/// * **512-expert sigmoid MoE with a gated shared expert** (`top_k=10`, router bias correction,
+///   top-k renormalization, `expert_weights_scale=1.0`) on EVERY layer.
+/// * **Zero-centered RMSNorm everywhere** except the KDA output norm (`ssm_norm`): the converter
+///   already baked `1 + weight` into `attn_norm`/`ffn_norm`/`attn_q_norm`/`attn_k_norm`/
+///   `output_norm`, so infr consumes them as ordinary weighted RMSNorm. `ssm_norm` stays raw.
+pub const ALICEAI: &str = "aliceai";
 /// Microsoft's official BitNet-b1.58 GGUFs (`microsoft/bitnet-b1.58-2B-4T-gguf`) declare
 /// `general.architecture = "bitnet-b1.58"` and prefix EVERY metadata key with it
 /// (`bitnet-b1.58.block_count`, …). Behaviorally identical to [`BITNET`] (same llama+SubLN
@@ -169,4 +195,5 @@ pub const ALL: &[&str] = &[
     QWEN35_MOE,
     QWEN4EXP,
     BAILINGMOE3,
+    ALICEAI,
 ];

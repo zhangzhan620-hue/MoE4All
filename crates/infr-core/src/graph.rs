@@ -1331,6 +1331,31 @@ pub enum Op {
         head_dim: u32,
         eps: f32,
         lower_bound: f32,
+        /// Decay form selector. `false` = Ling's `decay[k] = exp(lower_bound *
+        /// sigmoid(a[h]*(forget[k]+dt_bias[k])))` (the fields above). `true` = aliceai's
+        /// SOFTPLUS form `decay[h,k] = exp(a[h] * softplus(forget[h,k] + dt_bias[h,k]))`, where
+        /// `a` holds the CONVERTER-PREPARED coefficient `-exp(A_log)` (the GGUF's `ssm_a` is
+        /// already transformed — `conversion.json`: "transform KDA log-decay parameter"; the op
+        /// multiplies it in directly, it must NOT re-exp it), `lower_bound` is ignored, and `beta`
+        /// is `sigmoid(b_proj)` (no lower bound, no `*2`).
+        softplus: bool,
+    },
+    /// Depth-residual softmax mixing (Yandex aliceai's `_depth_softmax_mix`). `srcs` is a
+    /// contiguous `[n_src, rows, ne]` f32 stack (source-major): source `s`'s row `r` starts at
+    /// `(s*rows + r)*ne`. `score` is the per-channel `[ne]` mixing projection. Per row `r`:
+    /// for each source `s`, `rms = sqrt(mean_c(src[c]^2) + eps)` and
+    /// `sc[s] = Σ_c score[c]·src[c] / rms` (the converter folds the per-source RMSNorm weight
+    /// INTO `score`, so this normalization is WEIGHTLESS); then
+    /// `dst[r,c] = Σ_s softmax_s(sc)·src_s[c]`. `n_src == 1` is the identity mix (softmax of a
+    /// single score is 1).
+    AttnResMix {
+        srcs: TensorId,
+        score: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n_src: u32,
+        ne: u32,
+        eps: f32,
     },
     /// qwen35moe Qwen2-MoE-style shared-expert combine: `dst[r,c] = moe[r,c] + sigmoid(gate[r]) *
     /// shexp[r,c]` for `rows` rows of `n` elements. `moe` is the routed-MoE branch's output
@@ -1405,6 +1430,7 @@ impl Op {
             Op::Conv1dSilu { .. } => "Conv1dSilu",
             Op::DeltaNet { .. } => "DeltaNet",
             Op::Kda { .. } => "Kda",
+            Op::AttnResMix { .. } => "AttnResMix",
             Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
         }
     }
@@ -1705,6 +1731,12 @@ impl Op {
                 dst,
                 ..
             } => (vec![qkv, forget, beta, a, dt_bias, state], vec![state, dst]),
+            Op::AttnResMix {
+                srcs,
+                score,
+                dst,
+                ..
+            } => (vec![srcs, score], vec![dst]),
             Op::MoeSharedExpertAdd {
                 moe,
                 shexp,

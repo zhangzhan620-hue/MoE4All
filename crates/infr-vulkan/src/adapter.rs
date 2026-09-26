@@ -312,6 +312,7 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             | Op::Conv1dSilu { .. }
             | Op::DeltaNet { .. }
             | Op::Kda { .. }
+            | Op::AttnResMix { .. }
             | Op::HeadwiseSigmoidMul { .. } => {}
             _ => {}
         }
@@ -6307,6 +6308,7 @@ fn lower_op(
             head_dim,
             eps,
             lower_bound,
+            softplus,
         } => rec.kda(
             r(*qkv)?,
             r(*forget)?,
@@ -6320,6 +6322,25 @@ fn lower_op(
             *head_dim as usize,
             *eps,
             *lower_bound,
+            *softplus,
+        ),
+        // aliceai depth-residual softmax mixing.
+        Op::AttnResMix {
+            srcs,
+            score,
+            dst,
+            rows,
+            n_src,
+            ne,
+            eps,
+        } => rec.attn_res_mix(
+            r(*srcs)?,
+            r(*score)?,
+            r(*dst)?,
+            *rows as usize,
+            *n_src as usize,
+            *ne as usize,
+            *eps,
         ),
         // Elementwise gemma logit softcap `y = cap·tanh(x/cap)` (in-place safe).
         Op::Softcap { x, dst, cap, n } => {

@@ -348,7 +348,9 @@ fn prepare_parallel_prompt_state(
     turn_checkpoint: Option<TurnCheckpoint>,
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<PreparedParallelPrompt> {
-    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3;
+    // aliceai is a recurrent (KDA) model: prefix reuse via its carried conv/KDA state. Without
+    // this every agent step re-prefills the whole context (see the reuse branch below).
+    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3 || c.aliceai;
     let live_turn_start = recurrent_model
         .then(|| recurrent_extension_start(&kv.cached, prompt))
         .flatten();
@@ -1968,6 +1970,14 @@ fn generate_dense_backend_inner(
             } else {
                 wload(&[&p("attn_norm.weight")])?;
             }
+            // aliceai: the per-layer depth-residual mixing projections. `attn_res_score` is absent
+            // on layer 0 (which mixes the raw embeddings); `ffn_res_score` is on every layer.
+            if c.aliceai {
+                if l > 0 {
+                    wload(&[&p("attn_res_score.weight")])?;
+                }
+                wload(&[&p("ffn_res_score.weight")])?;
+            }
             if is_mla {
                 // MLA: wq_a → q_a_norm → wq_b (or wq for lite), wkv_a_mqa, kv_a_norm, wk_b, wv_b, wo.
                 if !c.is_lite {
@@ -2085,6 +2095,24 @@ fn generate_dense_backend_inner(
                 wload(&[&p("ssm_dt.bias")])?;
                 wload(&[&p("ssm_norm.weight")])?;
                 wload(&[&p("ssm_out.weight")])?;
+            } else if c.aliceai && !c.is_alice_attn_layer(l) {
+                // aliceai KDA layer. Q/K/V ship as SEPARATE tensors (often different quants — the
+                // fused concat requires a uniform dtype), so load them individually and let the
+                // graph pack them into `Op::Kda`'s `qkv` via CopyStrided. Then the single depthwise
+                // conv tensor and the low-rank alpha (`f_a`/`f_b`) + output-gate (`g_a`/`g_b`)
+                // projections. `attn_output` (the KDA o-proj) loads in the generic block below.
+                wload(&[&p("attn_q.weight")])?;
+                wload(&[&p("attn_k.weight")])?;
+                wload(&[&p("attn_v.weight")])?;
+                wload(&[&p("ssm_conv1d.weight")])?;
+                wload(&[&p("ssm_f_a.weight")])?;
+                wload(&[&p("ssm_f_b.weight")])?;
+                wload(&[&p("ssm_g_a.weight")])?;
+                wload(&[&p("ssm_g_b.weight")])?;
+                wload(&[&p("ssm_beta.weight")])?;
+                wload(&[&p("ssm_a")])?;
+                wload(&[&p("ssm_dt.bias")])?;
+                wload(&[&p("ssm_norm.weight")])?;
             } else if fuse_qkv {
                 wload(&[
                     &p("attn_q.weight"),
@@ -2105,7 +2133,8 @@ fn generate_dense_backend_inner(
                 wload(&[&p("attn_k.bias")])?;
                 wload(&[&p("attn_v.bias")])?;
             }
-            if qk_norm && !is_delta && !is_mla && !is_kda {
+            if qk_norm && !is_delta && !is_mla && !is_kda && !(c.aliceai && !c.is_alice_attn_layer(l))
+            {
                 wload(&[&p("attn_q_norm.weight")])?;
                 wload(&[&p("attn_k_norm.weight")])?;
             }
@@ -2193,7 +2222,7 @@ fn generate_dense_backend_inner(
                     wload(&[&p("ffn_up_exps.weight")])?;
                 }
                 wload(&[&p("ffn_down_exps.weight")])?;
-                if c.deepseek2 || c.bailingmoe3 {
+                if c.deepseek2 || c.bailingmoe3 || c.aliceai {
                     let ep_name = p("exp_probs_b.bias");
                     if g.tensors().iter().any(|t| t.name == ep_name) {
                         wload(&[&ep_name])?;
@@ -2260,6 +2289,11 @@ fn generate_dense_backend_inner(
             }
         } else {
             wload(&["output_norm.weight"])?;
+        }
+        // aliceai's final depth-residual mixing projection: loaded between `output_norm` and
+        // `output` (its `wpush` mirrors that order right after `w_out_norm`).
+        if c.aliceai {
+            wload(&["output_res_score.weight"])?;
         }
         // LM head = `output.weight`, or (tied) the quantized `token_embd.weight` mapped from the
         // mmap and dequantized per-row by `Op::Linear` — same f32 values as the host embedding.
@@ -2533,7 +2567,7 @@ fn generate_dense_backend_inner(
             None
         };
         let mut turn_recurrent_ckpt = None;
-        if turn_checkpoint.is_some() && (c.qwen35 || c.qwen4exp || c.bailingmoe3) {
+        if turn_checkpoint.is_some() && (c.qwen35 || c.qwen4exp || c.bailingmoe3 || c.aliceai) {
             TurnRecurrentCkpt::begin_before_dynamic_kv(
                 &mut turn_recurrent_ckpt,
                 be,
@@ -2833,7 +2867,7 @@ fn generate_dense_backend_inner(
     // A live append-only recurrent state wins when the new prompt extends it exactly. Otherwise
     // try the last stable conversation checkpoint before taking the unchanged zero-reset path.
     // Restoration is device-side work, so concurrent serve takes the same GPU baton as a forward.
-    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3;
+    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3 || c.aliceai;
     let cached_before_restore = state.as_ref().map_or(0, |kv| kv.cached.len());
     let common_before_restore = state_trace.then(|| {
         state
@@ -3094,7 +3128,7 @@ fn generate_dense_backend_inner(
                     TurnCheckpoint::Boundary(boundary) => Some(boundary),
                 })
                 .filter(|&boundary| {
-                    (c.qwen35 || c.qwen4exp || c.bailingmoe3)
+                    (c.qwen35 || c.qwen4exp || c.bailingmoe3 || c.aliceai)
                         && boundary > start
                         && boundary < prompt.len()
                         && boundary <= max_ctx
@@ -3378,6 +3412,15 @@ fn generate_dense_backend_inner(
              hyper-connection residual is hc_mult streams wide and a span hands over one",
             c.n_layer
         );
+        // aliceai's depth-residual source stack spans the whole model (completed blocks accumulate
+        // across layers), so a partial layer span — which hands over one `n_embd` residual — cannot
+        // express it.
+        assert!(
+            !c.aliceai || (l_first == 0 && l_end == c.n_layer),
+            "aliceai cannot be built as a partial layer span ({l_first}..{l_end} of {}): the \
+             depth-residual source stack spans the whole model",
+            c.n_layer
+        );
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
         g.independent_rows = independent_rows;
@@ -3632,6 +3675,19 @@ fn generate_dense_backend_inner(
             } else {
                 wpush(&mut g, &mut weights)
             };
+            // aliceai per-layer depth-residual projections — pushed in `wload` order (right after
+            // `attn_norm`): `attn_res_score` (absent on layer 0) then `ffn_res_score`.
+            let (alice_attn_res, alice_ffn_res) = if c.aliceai {
+                let ar = if l > 0 {
+                    Some(wpush(&mut g, &mut weights))
+                } else {
+                    None
+                };
+                let fr = Some(wpush(&mut g, &mut weights));
+                (ar, fr)
+            } else {
+                (None, None)
+            };
             // qwen35 gated-DeltaNet layer: 9 mixer weights, no q/k/v/qk_norm/bias/wo at all (mirrors
             // the `wload` skip above). `is_delta` is `false` for every non-qwen35 model.
             let is_delta = (c.qwen35 || c.qwen4exp) && !c.is_qwen_hybrid_attn_layer(l);
@@ -3702,6 +3758,13 @@ fn generate_dense_backend_inner(
                     norm: wpush(&mut g, &mut weights),
                     gate: wpush(&mut g, &mut weights),
                     out: wpush(&mut g, &mut weights),
+                    wk: None,
+                    wv: None,
+                    aliceai: false,
+                    f_a: None,
+                    f_b: None,
+                    g_a: None,
+                    g_b: None,
                 })
             } else if is_delta {
                 let qkv = wpush(&mut g, &mut weights);
@@ -3723,6 +3786,42 @@ fn generate_dense_backend_inner(
                     dt_bias,
                     ssm_norm,
                     out,
+                })
+            } else if c.aliceai && !c.is_alice_attn_layer(l) {
+                // aliceai KDA mixer — push order MUST mirror the `wload` arm above:
+                // q, k, v, conv, f_a, f_b, g_a, g_b, beta, a, dt_bias, norm, then `out`
+                // (attn_output, pushed in the generic block below). `forget`/`gate` alias
+                // `f_a`/`g_a` — unused.
+                let q = wpush(&mut g, &mut weights);
+                let wk = wpush(&mut g, &mut weights);
+                let wv = wpush(&mut g, &mut weights);
+                let conv = wpush(&mut g, &mut weights);
+                let f_a = wpush(&mut g, &mut weights);
+                let f_b = wpush(&mut g, &mut weights);
+                let g_a = wpush(&mut g, &mut weights);
+                let g_b = wpush(&mut g, &mut weights);
+                let beta = wpush(&mut g, &mut weights);
+                let a = wpush(&mut g, &mut weights);
+                let dt_bias = wpush(&mut g, &mut weights);
+                let norm = wpush(&mut g, &mut weights);
+                let out = wpush(&mut g, &mut weights);
+                MixerW::Kda(KdaW {
+                    qkv: q,
+                    wk: Some(wk),
+                    wv: Some(wv),
+                    conv,
+                    forget: f_a,
+                    beta,
+                    a,
+                    dt_bias,
+                    norm,
+                    gate: g_a,
+                    out,
+                    aliceai: true,
+                    f_a: Some(f_a),
+                    f_b: Some(f_b),
+                    g_a: Some(g_a),
+                    g_b: Some(g_b),
                 })
             } else {
                 // Fused QKV: ONE concatenated weight handle serves q/k/v (the builder bakes each
@@ -3953,6 +4052,8 @@ fn generate_dense_backend_inner(
                 dsv4_compressed,
                 attn_sub_norm,
                 post_attn,
+                alice_attn_res,
+                alice_ffn_res,
                 ffn_norm,
                 ffn,
                 ffn_sub_norm,
@@ -3994,6 +4095,11 @@ fn generate_dense_backend_inner(
             hc.norm
         } else {
             wpush(&mut g, &mut weights)
+        };
+        let w_out_res = if c.aliceai {
+            Some(wpush(&mut g, &mut weights))
+        } else {
+            None
         };
         let w_lm = wpush(&mut g, &mut weights);
         // DeepSeek V4's hyper-connection HEAD triple (`output_hc_fn/base/scale`) — model-level, and
@@ -4316,7 +4422,20 @@ fn generate_dense_backend_inner(
         // Ling KDA adds a vector forget projection, while its MLA layers add one gate scalar per
         // head. Both are shared scratch across mutually-exclusive layer mixer arms.
         let kda_forget = g.internal(f32d(batch * c.ssm_d_inner.max(1)));
+        // aliceai's low-rank KDA alpha/gate intermediate `[batch, kda_head_dim]` (Ling has no
+        // low-rank stage). Harmlessly tiny on every other arch.
+        let kda_low = g.internal(f32d(batch * c.kda_head_dim.max(1)));
         let mla_gate = g.internal(f32d(batch * c.n_head.max(1)));
+
+        // aliceai depth-residual scratch. `alice_srcs` is the `[n_src, batch, ne]` source stack
+        // (`Op::AttnResMix`'s layout): completed blocks are copied into slot 0.., and the running
+        // `partial` into the highest live slot. `alice_mix` holds one mix's output before it feeds
+        // the attn/ffn norm. `alice_partial` is the running block accumulator across the 4 layers
+        // of a block (`partial += attn_out; partial += moe_out`).
+        let alice_max_src = (c.n_layer / c.alice_block.max(1) + 2).max(2);
+        let alice_srcs = g.internal(f32d(alice_max_src * batch * ne));
+        let alice_partial = g.internal(f32d(batch * ne));
+        let alice_mix = g.internal(f32d(batch * ne));
 
         // Qwen3.8 HC/PLE scratch. The wide residual itself is caller-owned (`qwen_wide`); these
         // buffers are reused serially by each layer and by both HC modules in that layer.
@@ -4699,6 +4818,21 @@ fn generate_dense_backend_inner(
             }
         }
 
+        // aliceai depth-residual state: `alice_nblocks` counts the completed-block sources in
+        // `alice_srcs` (slot 0 is the embeddings), and `alice_have_partial` tracks whether the
+        // running block accumulator holds content (false at a block start / layer 0).
+        let mut alice_nblocks = 0usize;
+        let mut alice_have_partial = false;
+        if c.aliceai && l_first == 0 && l_end == c.n_layer {
+            g.push(Op::Copy {
+                src: hidden,
+                src_off: 0,
+                dst: alice_srcs,
+                dst_off: 0,
+                n: (batch * ne) as u32,
+            });
+            alice_nblocks = 1;
+        }
         for (l, lw) in lw.iter().enumerate().take(l_end).skip(l_first) {
             if let Some(pw) = &lw.ple {
                 let wide = qwen_wide.expect("a qwen4exp PLE layer needs qwen_wide");
@@ -4857,10 +4991,55 @@ fn generate_dense_backend_inner(
             } else {
                 (None, None)
             };
+            // aliceai: at a block boundary, commit the just-completed block residual into the
+            // source stack before mixing this layer's attention input. (l == 0 never triggers.)
+            if c.aliceai && l > 0 && l.is_multiple_of(c.alice_block.max(1)) {
+                if alice_have_partial {
+                    g.push(Op::Copy {
+                        src: alice_partial,
+                        src_off: 0,
+                        dst: alice_srcs,
+                        dst_off: (alice_nblocks * batch * ne) as u32,
+                        n: (batch * ne) as u32,
+                    });
+                }
+                alice_nblocks += 1;
+                alice_have_partial = false;
+            }
             // attn input norm. DeepSeek V4 reads the widened residual through its attention
             // hyper-connection wrap instead of reading `hidden` directly: the wrap collapses the
             // `hc_mult` streams into `hn`, and `attn_norm` then normalises that.
-            let attn_in = if let Some(hcl) = &lw.qwen_hc {
+            let attn_in = if c.aliceai {
+                // aliceai: layer 0 uses the raw embeddings; every later layer softmax-mixes the
+                // completed-block sources (slots 0..nblocks) plus the running `partial`.
+                if l == 0 {
+                    hidden
+                } else {
+                    let mut n_src = alice_nblocks;
+                    if alice_have_partial {
+                        g.push(Op::Copy {
+                            src: alice_partial,
+                            src_off: 0,
+                            dst: alice_srcs,
+                            dst_off: (alice_nblocks * batch * ne) as u32,
+                            n: (batch * ne) as u32,
+                        });
+                        n_src += 1;
+                    }
+                    g.push(Op::AttnResMix {
+                        srcs: alice_srcs,
+                        score: lw
+                            .alice_attn_res
+                            .expect("an aliceai layer past 0 carries attn_res_score"),
+                        dst: alice_mix,
+                        rows: batch as u32,
+                        n_src: n_src as u32,
+                        ne: ne as u32,
+                        eps,
+                    });
+                    alice_mix
+                }
+            } else if let Some(hcl) = &lw.qwen_hc {
                 let wide = qwen_wide.expect("qwen4exp layer needs qwen_wide");
                 qwen_hc_mix(&mut g, &hcl.attn, wide, hn);
                 hn
@@ -5052,17 +5231,54 @@ fn generate_dense_backend_inner(
                 // DeltaNet's residual contribution is already in `sub` — skip the attention-only
                 // code below (query/key/value projections, RoPE, Attention, o-proj) entirely.
             } else if let MixerW::Kda(kw) = &lw.mixer {
-                let inner = c.n_head * c.kda_head_dim;
+                let nh_k = if kw.aliceai { c.kda_n_head } else { c.n_head };
+                let inner = nh_k * c.kda_head_dim;
                 let packed = 3 * inner;
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: kw.qkv,
-                    dst: dn_qkvbuf,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: packed as u32,
-                    w_off: 0,
-                });
+                if kw.aliceai {
+                    // Separate (possibly differently-quantized) q/k/v projections, packed into
+                    // `Op::Kda`'s `qkv` buffer as q|k|v blocks per row.
+                    for (w, dst) in [
+                        (kw.qkv, dn_qbuf),
+                        (kw.wk.expect("aliceai KDA wk"), dn_kbuf),
+                        (kw.wv.expect("aliceai KDA wv"), dn_vbuf),
+                    ] {
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: w,
+                            dst,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: inner as u32,
+                            w_off: 0,
+                        });
+                    }
+                    for (src, off) in [
+                        (dn_qbuf, 0usize),
+                        (dn_kbuf, inner),
+                        (dn_vbuf, 2 * inner),
+                    ] {
+                        g.push(Op::CopyStrided {
+                            src,
+                            src_off: 0,
+                            src_stride: inner as u32,
+                            dst: dn_qkvbuf,
+                            dst_off: off as u32,
+                            dst_stride: packed as u32,
+                            rows: batch as u32,
+                            n: inner as u32,
+                        });
+                    }
+                } else {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: kw.qkv,
+                        dst: dn_qkvbuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: packed as u32,
+                        w_off: 0,
+                    });
+                }
                 g.push(Op::Conv1dSilu {
                     x: dn_qkvbuf,
                     weight: kw.conv,
@@ -5073,22 +5289,44 @@ fn generate_dense_backend_inner(
                     channels: packed as u32,
                     kernel: c.ssm_d_conv as u32,
                 });
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: kw.forget,
-                    dst: kda_forget,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: inner as u32,
-                    w_off: 0,
-                });
+                if kw.aliceai {
+                    // Low-rank alpha `f_b(f_a(x))` and output gate `g_b(g_a(x))` (head_v_dim-wide).
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: kw.f_a.expect("aliceai KDA f_a"),
+                        dst: kda_low,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: c.kda_head_dim as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::Linear {
+                        x: kda_low,
+                        weight: kw.f_b.expect("aliceai KDA f_b"),
+                        dst: kda_forget,
+                        m: batch as u32,
+                        in_f: c.kda_head_dim as u32,
+                        out_f: inner as u32,
+                        w_off: 0,
+                    });
+                } else {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: kw.forget,
+                        dst: kda_forget,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: inner as u32,
+                        w_off: 0,
+                    });
+                }
                 g.push(Op::Linear {
                     x: hn,
                     weight: kw.beta,
                     dst: dn_bbuf,
                     m: batch as u32,
                     in_f: ne as u32,
-                    out_f: c.n_head as u32,
+                    out_f: nh_k as u32,
                     w_off: 0,
                 });
                 g.push(Op::Kda {
@@ -5100,26 +5338,48 @@ fn generate_dense_backend_inner(
                     state: v_cache[l],
                     dst: dn_out,
                     rows: batch as u32,
-                    n_head: c.n_head as u32,
+                    n_head: nh_k as u32,
                     head_dim: c.kda_head_dim as u32,
                     eps,
                     lower_bound: c.kda_gate_lower_bound,
+                    softplus: kw.aliceai,
                 });
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: kw.gate,
-                    dst: dn_zbuf,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: inner as u32,
-                    w_off: 0,
-                });
+                if kw.aliceai {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: kw.g_a.expect("aliceai KDA g_a"),
+                        dst: kda_low,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: c.kda_head_dim as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::Linear {
+                        x: kda_low,
+                        weight: kw.g_b.expect("aliceai KDA g_b"),
+                        dst: dn_zbuf,
+                        m: batch as u32,
+                        in_f: c.kda_head_dim as u32,
+                        out_f: inner as u32,
+                        w_off: 0,
+                    });
+                } else {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: kw.gate,
+                        dst: dn_zbuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: inner as u32,
+                        w_off: 0,
+                    });
+                }
                 g.push(Op::QkNorm {
                     x: dn_out,
                     weight: Some(kw.norm),
                     dst: dn_out,
                     rows: batch as u32,
-                    n_head: c.n_head as u32,
+                    n_head: nh_k as u32,
                     head_dim: c.kda_head_dim as u32,
                     eps,
                     x_stride: 0,
@@ -6552,7 +6812,54 @@ fn generate_dense_backend_inner(
             // `residual` — so the widened stream ping-pongs `hcr[0] -> hcr[1]` here and
             // `hcr[1] -> hcr[0]` at the FFN tail below, returning to `hcr[0]` at each layer
             // boundary. The FFN's own wrap then collapses the NEW stream into `hn`.
-            if let Some(hcl) = &lw.qwen_hc {
+            if c.aliceai {
+                // aliceai: `partial += attn_out`, then softmax-mix (completed blocks + partial)
+                // into the FFN input norm. Layer 0 has `alice_have_partial == false` here, so this
+                // is the block's first accumulation (`partial = attn_out`).
+                if alice_have_partial {
+                    g.push(Op::Add {
+                        a: alice_partial,
+                        b: sub,
+                        dst: alice_partial,
+                        n: (batch * ne) as u32,
+                    });
+                } else {
+                    g.push(Op::Copy {
+                        src: sub,
+                        src_off: 0,
+                        dst: alice_partial,
+                        dst_off: 0,
+                        n: (batch * ne) as u32,
+                    });
+                    alice_have_partial = true;
+                }
+                g.push(Op::Copy {
+                    src: alice_partial,
+                    src_off: 0,
+                    dst: alice_srcs,
+                    dst_off: (alice_nblocks * batch * ne) as u32,
+                    n: (batch * ne) as u32,
+                });
+                g.push(Op::AttnResMix {
+                    srcs: alice_srcs,
+                    score: lw
+                        .alice_ffn_res
+                        .expect("every aliceai layer carries ffn_res_score"),
+                    dst: alice_mix,
+                    rows: batch as u32,
+                    n_src: (alice_nblocks + 1) as u32,
+                    ne: ne as u32,
+                    eps,
+                });
+                g.push(Op::RmsNorm {
+                    x: alice_mix,
+                    weight: lw.ffn_norm,
+                    dst: hn,
+                    rows: batch as u32,
+                    dim: ne as u32,
+                    eps,
+                });
+            } else if let Some(hcl) = &lw.qwen_hc {
                 let wide = qwen_wide.expect("qwen4exp layer needs qwen_wide");
                 g.push(Op::QwenHcInject {
                     residual: wide,
@@ -7077,6 +7384,14 @@ fn generate_dense_backend_inner(
                     hc: c.hc_mult as u32,
                     n_embd: ne as u32,
                 });
+            } else if c.aliceai {
+                // aliceai: `partial += moe_out` — closes the block's accumulation for this layer.
+                g.push(Op::Add {
+                    a: alice_partial,
+                    b: sub,
+                    dst: alice_partial,
+                    n: (batch * ne) as u32,
+                });
             } else {
                 g.push(Op::Add {
                     a: hidden,
@@ -7201,13 +7516,34 @@ fn generate_dense_backend_inner(
                 let wide = qwen_wide.expect("qwen4exp model head needs qwen_wide");
                 qwen_hc_mix(&mut g, t, wide, hn);
             }
+            if c.aliceai {
+                // aliceai model head: final depth-residual softmax mix over every completed block
+                // plus the last partial, BEFORE `output_norm` (which the LM tail below applies to
+                // `alice_mix`).
+                g.push(Op::Copy {
+                    src: alice_partial,
+                    src_off: 0,
+                    dst: alice_srcs,
+                    dst_off: (alice_nblocks * batch * ne) as u32,
+                    n: (batch * ne) as u32,
+                });
+                g.push(Op::AttnResMix {
+                    srcs: alice_srcs,
+                    score: w_out_res.expect("aliceai model head carries output_res_score"),
+                    dst: alice_mix,
+                    rows: batch as u32,
+                    n_src: (alice_nblocks + 1) as u32,
+                    ne: ne as u32,
+                    eps,
+                });
+            }
         }
         // LM-head tail — skipped entirely for headless builds (`logits_rows == 0`, the batched
         // prefill chunks: see `logits`' declaration above).
         let (h_out, tok_id, u_in) = if let Some(logits) = logits {
             if !c.qwen4exp {
                 g.push(Op::RmsNorm {
-                    x: hidden,
+                    x: if c.aliceai { alice_mix } else { hidden },
                     weight: w_out_norm,
                     dst: hn,
                     rows: batch as u32,

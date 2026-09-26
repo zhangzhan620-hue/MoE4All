@@ -8913,16 +8913,18 @@ impl<'a> Recorder<'a> {
         head_dim: usize,
         eps: f32,
         lower_bound: f32,
+        softplus: bool,
     ) {
         debug_assert!(head_dim <= 128, "kda shader assumes head_dim <= 128");
-        let kern = self.be.kernel("kda", crate::gemm::kda_spv(), 7, 24);
-        let mut push = [0u8; 24];
+        let kern = self.be.kernel("kda", crate::gemm::kda_spv(), 7, 28);
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_head as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(head_dim as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&eps.to_ne_bytes());
         push[16..20].copy_from_slice(&lower_bound.to_ne_bytes());
         push[20..24].copy_from_slice(&(1.0f32 / (head_dim as f32).sqrt()).to_ne_bytes());
+        push[24..28].copy_from_slice(&(softplus as u32).to_ne_bytes());
         let n_blk = head_dim.div_ceil(32);
         self.dispatch(
             kern,
@@ -8938,6 +8940,36 @@ impl<'a> Recorder<'a> {
             2,
             &push,
             (n_head * n_blk) as u32,
+        );
+    }
+
+    /// aliceai depth-residual softmax mixing (`Op::AttnResMix`): one workgroup per row reduces the
+    /// channel axis per source, softmaxes the per-source scores, and writes the weighted sum.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_res_mix(
+        &self,
+        srcs: &dyn Buffer,
+        score: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: usize,
+        n_src: usize,
+        ne: usize,
+        eps: f32,
+    ) {
+        debug_assert!(n_src <= 64, "attn_res_mix shader supports n_src <= 64");
+        let k = self
+            .be
+            .kernel("attn_res_mix", crate::gemm::attn_res_mix_spv(), 3, 16);
+        let mut pc = (rows as u32).to_ne_bytes().to_vec();
+        pc.extend_from_slice(&(n_src as u32).to_ne_bytes());
+        pc.extend_from_slice(&(ne as u32).to_ne_bytes());
+        pc.extend_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(srcs), Self::vkb(score), Self::vkb(dst)],
+            1,
+            &pc,
+            rows.max(1) as u32,
         );
     }
 

@@ -13,12 +13,13 @@ layout(push_constant) uniform PC {
     float eps;
     float lower_bound;
     float qscale;
+    uint softplus;
 } pc;
 
 layout(binding = 0) readonly buffer QB { float qkv[]; };       // [rows, 3*n_head*head_dim]
 layout(binding = 1) readonly buffer FB { float forget[]; };    // [rows, n_head*head_dim]
 layout(binding = 2) readonly buffer BB { float beta[]; };      // [rows, n_head]
-layout(binding = 3) readonly buffer AB { float a[]; };         // [n_head], already exp(A_log)
+layout(binding = 3) readonly buffer AB { float a[]; };         // [n_head]
 layout(binding = 4) readonly buffer DB { float dt_bias[]; };   // [n_head*head_dim]
 layout(binding = 5) buffer SB { float state[]; };              // [n_head, head_dim, head_dim]
 layout(binding = 6) writeonly buffer OB { float outp[]; };     // [rows, n_head*head_dim]
@@ -63,9 +64,17 @@ void main() {
             kn[k] = kv;
             qs += qv * qv;
             ks += kv * kv;
-            float z = a[h] * (forget[fbase + k] + dt_bias[hbase + k]);
-            float log_decay = pc.lower_bound / (1.0 + exp(-z));
-            decay[k] = exp(log_decay);
+            if (pc.softplus != 0u) {
+                // aliceai: `a` already holds the converter's -exp(A_log); decay = exp(a·softplus(f+dt)).
+                float g = forget[fbase + k] + dt_bias[hbase + k];
+                float sp = g > 20.0 ? g : log(1.0 + exp(g));
+                decay[k] = exp(a[h] * sp);
+            } else {
+                // Ling: decay = exp(lower_bound·sigmoid(a·(forget+dt))).
+                float z = a[h] * (forget[fbase + k] + dt_bias[hbase + k]);
+                float log_decay = pc.lower_bound / (1.0 + exp(-z));
+                decay[k] = exp(log_decay);
+            }
         }
         red[lane] = qs;
         barrier();

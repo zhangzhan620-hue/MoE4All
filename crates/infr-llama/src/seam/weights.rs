@@ -154,6 +154,20 @@ pub(super) struct KdaW {
     pub(super) norm: TensorId,
     pub(super) gate: TensorId,
     pub(super) out: TensorId,
+    /// aliceai: the K/Q/V projections ship as SEPARATE tensors with potentially DIFFERENT
+    /// quantization (the loader's fused concat requires a uniform dtype), so they load as three
+    /// handles and the runner packs them into `Op::Kda`'s `qkv` buffer via `CopyStrided`. `None`
+    /// for Ling, whose `qkv` is the concatenated upload.
+    pub(super) wk: Option<TensorId>,
+    pub(super) wv: Option<TensorId>,
+    /// aliceai: low-rank KDA alpha (`f_a`/`f_b`) and output-gate (`g_a`/`g_b`) projections. On
+    /// aliceai `forget`/`gate` above alias `f_a`/`g_a` (the single-handle slots are unused); the
+    /// runner emits the two-stage projection through these. `false`/`None` for Ling.
+    pub(super) aliceai: bool,
+    pub(super) f_a: Option<TensorId>,
+    pub(super) f_b: Option<TensorId>,
+    pub(super) g_a: Option<TensorId>,
+    pub(super) g_b: Option<TensorId>,
 }
 
 /// DeepSeek V2+ MLA (Multi-head Latent Attention) mixer weights — absorbed form. The KV cache holds
@@ -331,6 +345,11 @@ pub(super) struct LayerW {
     /// o-projection (`AttnW::wo`). `Some` only when `Config::sub_norm` (bitnet); `None` elsewhere.
     pub(super) attn_sub_norm: Option<TensorId>,
     pub(super) post_attn: Option<TensorId>,
+    /// aliceai per-layer depth-residual mixing projections. `alice_attn_res` (the `attn_res_score`
+    /// vector) is `None` on layer 0, which uses the raw embeddings; `alice_ffn_res` is present on
+    /// every layer. `None` for every non-aliceai model.
+    pub(super) alice_attn_res: Option<TensorId>,
+    pub(super) alice_ffn_res: Option<TensorId>,
     pub(super) ffn_norm: TensorId,
     pub(super) ffn: FfnW,
     /// bitnet SubLN: RMSNorm on the FFN intermediate (`[n_ff]`) BEFORE `ffn_down`. `Some` only for
@@ -1100,7 +1119,7 @@ impl SeamKv {
             &self.qsa_kbufs,
             &self.qsa_cbufs,
         )?;
-        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 {
+        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 || cfg.aliceai {
             let conv_elems = (cfg.ssm_d_conv - 1) * cfg.recurrent_conv_channels();
             let s_elems = cfg.recurrent_state_elems();
             let conv_zero = vec![0f32; conv_elems];
@@ -1478,7 +1497,7 @@ impl SeamKv {
             None
         };
         let mut turn_recurrent_ckpt = None;
-        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 {
+        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 || cfg.aliceai {
             TurnRecurrentCkpt::begin(
                 &mut turn_recurrent_ckpt,
                 be,
@@ -1580,7 +1599,7 @@ impl SeamKv {
         src: &SeamKv,
         p: usize,
     ) -> AResult<()> {
-        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 || cfg.deepseek4 {
+        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 || cfg.deepseek4 || cfg.aliceai {
             return Ok(());
         }
         let p = p.min(src.cached.len()).min(self.max_ctx);

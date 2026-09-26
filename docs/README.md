@@ -67,6 +67,9 @@ at that index. It holds:
 - [deepseek.md](deepseek.md) — the DeepSeek family port plan (V1 → V2/V3 → V3.2
   → V4), staged around the fact that only the first two stages have a model
   small enough to develop against. Nothing implemented yet.
+- [aliceai.md](aliceai.md) — Yandex AliceAI-Foundation (`aliceai`): the period-4
+  KDA/full-attention hybrid, depth-residual softmax mixing, and the gated
+  shared-expert MoE.
 
 ## Roadmaps & history
 

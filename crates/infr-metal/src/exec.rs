@@ -5773,6 +5773,13 @@ impl MetalBackend {
                         .into(),
                 ));
             }
+            Op::AttnResMix { .. } => {
+                // aliceai (Yandex AliceAI-Foundation) depth-residual softmax mixing — landed on
+                // CPU + Vulkan only; no Metal kernel. Fails loudly instead of a silent wrong run.
+                return Err(Error::Unsupported(
+                    "Metal Op::AttnResMix (aliceai depth-residual mix) not yet implemented".into(),
+                ));
+            }
             Op::Rope2D { .. }
             | Op::QkNormMrope { .. }
             | Op::Dsv4Compress { .. }

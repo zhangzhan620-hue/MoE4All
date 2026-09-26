@@ -1002,6 +1002,33 @@ mod tests {
         assert!(Penalties::resolve(None).is_none());
     }
 
+    /// The `aliceai` arch defaults (`presence_penalty = 1.0`, `repeat_penalty = 1.1`, exactly the
+    /// values `infr_server::aliceai_output_policy(true)` sets on `GenParams`) must be non-neutral AND
+    /// actually reshape the logits row in [`Penalties::apply`]. A default that reached `GenParams`
+    /// but never made it here would leave the base model looping, so this is the sampler half of the
+    /// end-to-end proof.
+    #[test]
+    fn aliceai_default_penalties_are_active_and_applied() {
+        let ctx = RequestCtx::new(RequestSampling {
+            presence_penalty: 1.0,
+            frequency_penalty: 0.0,
+            repeat_penalty: 1.1,
+            ..Default::default()
+        });
+        let mut p = Penalties::resolve(Some(&ctx)).expect("aliceai defaults are active penalties");
+        p.observe(3);
+        let mut logits = vec![0.0f32; 4];
+        logits[3] = 11.0;
+        p.apply(&mut logits);
+        // Order mirrors llama.cpp: repeat first (positive logit -> /1.1 = 10.0), then presence
+        // (flat -1.0) -> 9.0. Approximate because 1.1 is not exactly representable in f32.
+        assert!(
+            (logits[3] - 9.0).abs() < 1e-4,
+            "aliceai default penalties must reshape logits, got {}",
+            logits[3]
+        );
+    }
+
     /// **Finding 1 — repeat penalty is per-DISTINCT-token, not per-occurrence.** llama.cpp's
     /// `penalties` sampler divides a repeated token's positive logit by `repeat` exactly ONCE, no
     /// matter how many times it appears in the window. The old code walked the raw `recent` deque

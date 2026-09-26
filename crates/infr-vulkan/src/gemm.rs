@@ -3441,6 +3441,13 @@ pub(crate) fn kda_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for aliceai's depth-residual softmax mixing.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_res_mix_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_res_mix.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for DeltaNet reading q/k/v from a single strided source buffer (env-gated).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_strided_spv() -> &'static [u32] {

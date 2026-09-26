@@ -984,7 +984,7 @@ pub(crate) fn dense_act_reserve_at(
     // Plus its attention out-gate pair (`qg` + `gate_a`), which every arch declares but only this
     // one makes big: qwen35 interleaves q and gate in one projection, so `qg` is DOUBLE the q
     // width and the umbrella's n_embd term no longer covers the three of them.
-    let deltanet = if cfg.qwen35 || cfg.qwen4exp {
+    let deltanet = if cfg.qwen35 || cfg.qwen4exp || cfg.aliceai {
         4 * (2 * cfg.q35_conv_channels()
             + cfg.ssm_d_inner
             + 2 * cfg.q35_num_k_heads() * cfg.q35_head_k_dim()
@@ -2474,7 +2474,7 @@ const WINDOWS_LARGE_REBAR_AGGRESSIVE_STARTUP_RESERVE: u64 = 512 * 1024 * 1024;
 fn load_driver_reserve(cfg: &Config) -> u64 {
     if cfg.deepseek4 {
         DEEPSEEK4_LOAD_DRIVER_RESERVE
-    } else if cfg!(windows) && (cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3) {
+    } else if cfg!(windows) && (cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 || cfg.aliceai) {
         WINDOWS_LARGE_REBAR_LOAD_DRIVER_RESERVE
     } else {
         0

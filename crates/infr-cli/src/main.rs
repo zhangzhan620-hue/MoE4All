@@ -2401,6 +2401,12 @@ impl infr_server::ChatGenerator for ParallelGenerator {
             on_delta,
         )
     }
+
+    /// The `aliceai` base model gets the CoT-strip + user-turn-stop policy; every other arch is
+    /// [`infr_server::ChatOutputPolicy::default`] (byte-identical to before).
+    fn output_policy(&self) -> infr_server::ChatOutputPolicy {
+        infr_server::aliceai_output_policy(self.engine.is_aliceai())
+    }
 }
 
 /// Tool-call parsing is enabled only when the request offers at least one tool and has not
@@ -2410,6 +2416,34 @@ fn tool_parsing_allowed(tools: Option<&serde_json::Value>, tool_choice: Option<&
         .and_then(serde_json::Value::as_array)
         .is_some_and(|tools| !tools.is_empty())
         && tool_choice != Some("none")
+}
+
+/// Feed one RAW decoded piece through the per-request output filters and into the splitter:
+/// optional CoT stripping (`aliceai`) → stop matching → reasoning/content splitter. `cot` is `None`
+/// for every model that did not ask for CoT hiding, making the path an exact passthrough. A stop hit
+/// OR the client `cancel` latch aborts THIS sequence's decode at its next poll.
+fn push_visible_piece(
+    piece: &str,
+    cot: &mut Option<infr_server::CotFilter>,
+    stops: &mut infr_server::StopMatcher,
+    stream: &mut infr_engine::ChatStream,
+    od: &mut dyn FnMut(infr_engine::Delta),
+    cancel: &std::sync::atomic::AtomicBool,
+    req: &infr_llama::sampling::RequestCtx,
+) {
+    let visible = match cot.as_mut() {
+        Some(filter) => filter.push(piece),
+        None => piece.to_owned(),
+    };
+    if !visible.is_empty() {
+        let safe = stops.push(&visible);
+        if !safe.is_empty() {
+            stream.push(&safe, od);
+        }
+    }
+    if stops.hit() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        req.abort();
+    }
 }
 
 /// The OpenAI chat body, shared by every serve backend: render the conversation through the model's
@@ -2542,6 +2576,10 @@ fn run_chat(
         // matcher and the latch are both per-call locals, so N concurrent requests each stop on
         // their OWN stop strings and nobody else's.
         let mut stops = infr_server::StopMatcher::new(params.stop.clone());
+        // aliceai (and any future arch that asks for it): the raw text first passes through the CoT
+        // filter, so the hidden `[COT_START]…[COT_END]` segment is removed BEFORE the stop matcher
+        // and the reasoning/content splitter ever see it. `None` for every other model — passthrough.
+        let mut cot = params.strip_cot.then(infr_server::CotFilter::new);
         let stats = {
             let od = &mut *on_delta;
             // Template-prefilled thinking (the PROMPT ends with the `<think>` opener): inject a
@@ -2551,15 +2589,9 @@ fn run_chat(
                 stream.push("<think>", &mut *od);
             }
             let mut on_piece = |piece: &str| {
-                let safe = stops.push(piece);
-                if !safe.is_empty() {
-                    stream.push(&safe, &mut *od);
-                }
-                // A stop sequence hit OR a client disconnect (the server latched `cancel`) both
-                // abort THIS sequence's decode at its next poll, freeing the GPU slot promptly.
-                if stops.hit() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    req.abort();
-                }
+                push_visible_piece(
+                    piece, &mut cot, &mut stops, &mut stream, &mut *od, cancel, &req,
+                );
             };
             let stats = if images.is_empty() {
                 be.generate(
@@ -2580,8 +2612,17 @@ fn run_chat(
                     &mut on_piece,
                 )?
             };
-            // No stop fired: whatever the matcher was holding back was never a stop prefix.
-            let tail = stops.flush();
+            // Flush the CoT filter FIRST (its held tail is VISIBLE text that still needs stop
+            // matching), then the stop matcher (whatever it held was never a stop prefix).
+            let cot_tail = cot
+                .as_mut()
+                .map(infr_server::CotFilter::finish)
+                .unwrap_or_default();
+            let mut tail = String::new();
+            if !cot_tail.is_empty() {
+                tail.push_str(&stops.push(&cot_tail));
+            }
+            tail.push_str(&stops.flush());
             if !tail.is_empty() {
                 stream.push(&tail, &mut *od);
             }

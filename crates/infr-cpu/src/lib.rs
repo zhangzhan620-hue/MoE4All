@@ -4100,6 +4100,7 @@ impl Backend for CpuBackend {
                     head_dim,
                     eps,
                     lower_bound,
+                    softplus,
                 } => {
                     let (rr, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                     let inner = nh * hd;
@@ -4133,9 +4134,16 @@ impl Backend for CpuBackend {
                             for v in 0..hd {
                                 let mut pred = 0.0f32;
                                 for k in 0..hd {
-                                    let gate =
-                                        a[h] * (forget[t * inner + hv + k] + dt_bias[hv + k]);
-                                    let log_decay = lower_bound / (1.0 + (-gate).exp());
+                                    let sg = forget[t * inner + hv + k] + dt_bias[hv + k];
+                                    let log_decay = if softplus {
+                                        // aliceai: `a` already holds the converter's -exp(A_log);
+                                        // decay = exp(a·softplus(g)).
+                                        let g = if sg > 20.0 { sg } else { (1.0 + sg.exp()).ln() };
+                                        a[h] * g
+                                    } else {
+                                        // Ling: decay = exp(lower_bound·sigmoid(a·g)).
+                                        lower_bound / (1.0 + (-(a[h] * sg)).exp())
+                                    };
                                     let si = sbase + k * hd + v;
                                     st[si] *= log_decay.exp();
                                     pred += st[si] * (qkv[kbase + k] * kinv);
@@ -4150,6 +4158,57 @@ impl Backend for CpuBackend {
                                 }
                                 out[t * inner + hv + v] = o;
                             }
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
+                Op::AttnResMix {
+                    srcs,
+                    score,
+                    dst,
+                    rows,
+                    n_src,
+                    ne,
+                    eps,
+                } => {
+                    let (rr, ns, nd) = (rows as usize, n_src as usize, ne as usize);
+                    let srcs = vals[srcs.0 as usize].clone();
+                    let sc_w = weight(score);
+                    let mut out = vec![0.0f32; rr * nd];
+                    let mut scores = vec![0.0f32; ns.max(1)];
+                    for r in 0..rr {
+                        let mut mx = f32::NEG_INFINITY;
+                        for s in 0..ns {
+                            let base = (s * rr + r) * nd;
+                            let mut ss = 0.0f32;
+                            let mut dot = 0.0f32;
+                            for c in 0..nd {
+                                let x = srcs[base + c];
+                                ss += x * x;
+                                dot += sc_w[c] * x;
+                            }
+                            let rms = (ss / (nd as f32) + eps).sqrt();
+                            let sc = if rms > 0.0 { dot / rms } else { 0.0 };
+                            scores[s] = sc;
+                            if sc > mx {
+                                mx = sc;
+                            }
+                        }
+                        let mut sum = 0.0f32;
+                        for s in 0..ns {
+                            scores[s] = (scores[s] - mx).exp();
+                            sum += scores[s];
+                        }
+                        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                        for s in 0..ns {
+                            scores[s] *= inv;
+                        }
+                        for c in 0..nd {
+                            let mut acc = 0.0f32;
+                            for s in 0..ns {
+                                acc += scores[s] * srcs[(s * rr + r) * nd + c];
+                            }
+                            out[r * nd + c] = acc;
                         }
                     }
                     vals[dst.0 as usize] = out;
@@ -4937,6 +4996,7 @@ mod tests {
             head_dim: 2,
             eps: 0.0,
             lower_bound: -5.0,
+            softplus: false,
         });
 
         let be = CpuBackend::new();
@@ -4975,6 +5035,114 @@ mod tests {
         be.download(state_b.as_ref(), &mut state_bytes).unwrap();
         let got_state: &[f32] = bytemuck::cast_slice(&state_bytes);
         assert_eq!(got_state, &[1.0, 2.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn kda_softplus_decay_matches_reference() {
+        use infr_core::tensor::TensorDesc;
+
+        let mut graph = Graph::new();
+        let qkv = graph.input(TensorDesc::new(vec![3], DType::F32));
+        let forget = graph.input(TensorDesc::new(vec![1], DType::F32));
+        let beta = graph.input(TensorDesc::new(vec![1], DType::F32));
+        let state = graph.input(TensorDesc::new(vec![1], DType::F32));
+        let a = graph.weight(TensorDesc::new(vec![1], DType::F32));
+        let dt_bias = graph.weight(TensorDesc::new(vec![1], DType::F32));
+        let out = graph.output(TensorDesc::new(vec![1], DType::F32));
+        graph.push(Op::Kda {
+            qkv,
+            forget,
+            beta,
+            a,
+            dt_bias,
+            state,
+            dst: out,
+            rows: 1,
+            n_head: 1,
+            head_dim: 1,
+            eps: 0.0,
+            lower_bound: 0.0,
+            softplus: true,
+        });
+
+        let be = CpuBackend::new();
+        let upload = |v: &[f32], usage| {
+            let b = be.alloc(v.len() * 4, usage).unwrap();
+            be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+            b
+        };
+        // q=1, k=1, v=2; ssm_a = -exp(A_log) = -0.5 (the converter's prepared value); forget=0,
+        // dt_bias=0, beta=0.
+        let qkv_b = upload(&[1.0, 1.0, 2.0], BufferUsage::Activations);
+        let forget_b = upload(&[0.0], BufferUsage::Activations);
+        let beta_b = upload(&[0.0], BufferUsage::Activations);
+        let state_b = upload(&[0.0], BufferUsage::KvCache);
+        let a_b = upload(&[-0.5], BufferUsage::Weights);
+        let dt_b = upload(&[0.0], BufferUsage::Weights);
+        let out_b = be.alloc(4, BufferUsage::Readback).unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(qkv, qkv_b.as_ref())
+            .bind(forget, forget_b.as_ref())
+            .bind(beta, beta_b.as_ref())
+            .bind(state, state_b.as_ref())
+            .bind(a, a_b.as_ref())
+            .bind(dt_bias, dt_b.as_ref())
+            .bind(out, out_b.as_ref());
+        let plan = be.compile(&graph).unwrap();
+        be.execute(plan.as_ref(), &bindings).unwrap();
+
+        let mut out_bytes = vec![0u8; 4];
+        be.download(out_b.as_ref(), &mut out_bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&out_bytes);
+        // decay = exp(-0.5 * softplus(0)) = exp(-0.5 * ln 2) = 1/√2.
+        // state = k*delta = 1 * (2 - 0) * sigmoid(0) = 1; out = q * state = 1.
+        assert!((got[0] - 1.0).abs() < 1e-6, "{got:?}");
+    }
+
+    #[test]
+    fn attn_res_mix_softmax_weights_sources() {
+        use infr_core::tensor::TensorDesc;
+
+        let mut graph = Graph::new();
+        // n_src=2, rows=1, ne=2: sources [1,0] and [0,1]; score [1,1].
+        let srcs = graph.input(TensorDesc::new(vec![4], DType::F32));
+        let score = graph.weight(TensorDesc::new(vec![2], DType::F32));
+        let dst = graph.output(TensorDesc::new(vec![2], DType::F32));
+        graph.push(Op::AttnResMix {
+            srcs,
+            score,
+            dst,
+            rows: 1,
+            n_src: 2,
+            ne: 2,
+            eps: 0.0,
+        });
+
+        let be = CpuBackend::new();
+        let upload = |v: &[f32], usage| {
+            let b = be.alloc(v.len() * 4, usage).unwrap();
+            be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+            b
+        };
+        let srcs_b = upload(&[1.0, 0.0, 0.0, 1.0], BufferUsage::Activations);
+        let score_b = upload(&[1.0, 1.0], BufferUsage::Weights);
+        let dst_b = be.alloc(8, BufferUsage::Readback).unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(srcs, srcs_b.as_ref())
+            .bind(score, score_b.as_ref())
+            .bind(dst, dst_b.as_ref());
+        let plan = be.compile(&graph).unwrap();
+        be.execute(plan.as_ref(), &bindings).unwrap();
+
+        let mut out_bytes = vec![0u8; 8];
+        be.download(dst_b.as_ref(), &mut out_bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&out_bytes);
+        // Both sources share rms=1/√2 and dot=1 → equal scores → softmax = 1/2 each →
+        // dst = 0.5*[1,0] + 0.5*[0,1] = [0.5, 0.5].
+        assert!((got[0] - 0.5).abs() < 1e-6, "{got:?}");
+        assert!((got[1] - 0.5).abs() < 1e-6, "{got:?}");
     }
 
     #[test]

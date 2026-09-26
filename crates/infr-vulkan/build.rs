@@ -843,6 +843,7 @@ fn main() {
         ("softmax", "softmax_dyn", &["-DUSE_SCALE_BUF"]),
         ("deltanet", "deltanet", &[]),
         ("kda", "kda", &[]),
+        ("attn_res_mix", "attn_res_mix", &[]),
         // Strided variant: q/k/v read from single convout buffer with offsets (env-gated).
         ("deltanet_strided", "deltanet_strided", &[]),
         ("deltanet_chunked", "deltanet_chunked", &[]),

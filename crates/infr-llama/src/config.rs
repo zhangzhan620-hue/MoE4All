@@ -147,6 +147,22 @@ pub struct Config {
     /// `attn_q` (`[h0 q(hd) | h0 gate(hd) | h1 q | h1 gate | …]`, NOT two contiguous blocks) —
     /// the one real trap in `docs/qwen35.md`. `true` only for qwen35.
     pub attn_out_gate: bool,
+    /// Yandex AliceAI-Foundation (`general.architecture = "aliceai"`): a hybrid recurrent/full
+    /// attention MoE whose per-layer graph is NOT the shared transformer skeleton. `true` only for
+    /// `arch == "aliceai"`. Gates the period-4 KDA/full-attention split (`alice_full_attn`), the
+    /// depth-residual softmax mixing (`Op::AttnResMix` and the `*_res_score` tensors), the KDA
+    /// softplus log-decay, and the every-layer shared-expert MoE. See [`crate::arch::ALICEAI`].
+    pub aliceai: bool,
+    /// aliceai: per-layer full-attention selector — `true` where layer `il` is full attention
+    /// (the GGUF's `attention.head_count_kv[il] > 0`), `false` on KDA recurrent layers. Empty on
+    /// every other arch.
+    pub alice_full_attn: Vec<bool>,
+    /// aliceai: KDA key/value head count (`ssm.time_step_rank`, 32 on 80B-A3B) — distinct from the
+    /// attention head count `n_head` (16). Drives the KDA recurrent conv/state widths.
+    pub kda_n_head: usize,
+    /// aliceai: depth-residual block size (`attn_res.block_size`, 4) — a completed-block residual
+    /// is appended to the mix list every this many layers.
+    pub alice_block: usize,
     /// MTP/NextN (Qwen3.5/3.6, issue #33 — see `docs/mtp.md`): the number of extra decoder blocks
     /// `{arch}.block_count` includes BEYOND the trunk (`{arch}.nextn_predict_layers`). `n_layer`
     /// above is already the TRUNK count (`block_count - n_layer_nextn`) — every existing field/
@@ -570,15 +586,24 @@ impl Config {
         self.deepseek2 || self.is_bailing_mla_layer(il)
     }
 
+    /// aliceai: whether layer `il` is one of the full-attention layers (vs KDA linear attention).
+    /// Read from the GGUF's per-layer `attention.head_count_kv` array — the authoritative marker.
+    pub fn is_alice_attn_layer(&self, il: usize) -> bool {
+        self.aliceai && self.alice_full_attn.get(il).copied().unwrap_or(false)
+    }
+
     pub fn is_recurrent_layer(&self, il: usize) -> bool {
         (self.qwen35 && !self.is_qwen35_attn_layer(il))
             || (self.qwen4exp && self.recurrent_layers.get(il).copied().unwrap_or(false))
             || (self.bailingmoe3 && !self.is_bailing_mla_layer(il))
+            || (self.aliceai && !self.is_alice_attn_layer(il))
     }
 
     pub fn recurrent_conv_channels(&self) -> usize {
         if self.bailingmoe3 {
             3 * self.n_head * self.kda_head_dim
+        } else if self.aliceai {
+            3 * self.kda_n_head * self.kda_head_dim
         } else {
             self.q35_conv_channels()
         }
@@ -587,6 +612,8 @@ impl Config {
     pub fn recurrent_state_elems(&self) -> usize {
         if self.bailingmoe3 {
             self.n_head * self.kda_head_dim * self.kda_head_dim
+        } else if self.aliceai {
+            self.kda_n_head * self.kda_head_dim * self.kda_head_dim
         } else {
             self.q35_num_v_heads() * self.q35_head_k_dim() * self.q35_head_v_dim()
         }
@@ -646,6 +673,9 @@ impl Config {
             // (Qwen3.6 MoE) shares the exact same attention/qk-norm shape as dense `QWEN35` — only
             // its FFN differs (see the `moe`/`shexp_ff` parses below).
             crate::arch::QWEN35 | crate::arch::QWEN35_MOE | crate::arch::QWEN4EXP => true,
+            // aliceai's full-attention layers are qk-normed (zero-centered q/k RMSNorm, baked to
+            // `1 + weight` by the converter), so the same QkNormRope machinery applies.
+            crate::arch::ALICEAI => true,
             other => bail!(
                 "infr-llama supports architecture={} (plus {}|{}|{}), got {other:?}",
                 crate::arch::TRANSFORMER.join("|"),
@@ -712,6 +742,9 @@ impl Config {
         let qwen35 = arch == crate::arch::QWEN35 || qwen35_moe;
         let qwen4exp = arch == crate::arch::QWEN4EXP;
         let bailingmoe3 = arch == crate::arch::BAILINGMOE3;
+        // aliceai (Yandex AliceAI-Foundation): hybrid KDA/full-attention MoE with depth-residual
+        // softmax mixing. Almost nothing rides the shared transformer skeleton — see the arch doc.
+        let aliceai = arch == crate::arch::ALICEAI;
         let mla_arch = deepseek2 || bailingmoe3;
         let mk = |k: &str| format!("{arch}.{k}");
         // DeepSeek2-specific metadata: MLA dims, MoE gating function, YaRN (everything EXCEPT
@@ -765,7 +798,7 @@ impl Config {
             (0, 0, 0, 0, 0)
         };
         let (expert_gating_func, expert_weights_norm, rope_yarn_log_mul) =
-            if deepseek2 || deepseek4 || bailingmoe3 {
+            if deepseek2 || deepseek4 || bailingmoe3 || aliceai {
                 // deepseek2 tolerates the key's absence (llama.cpp documents 0 as "softmax", the
                 // pre-`expert_gating_func` V2/V2.5 files); `deepseek32.cpp` and `deepseek4.cpp` read it
                 // with no such fallback, and neither arch's real value is softmax — defaulting it would
@@ -1128,6 +1161,16 @@ impl Config {
         // DeepSeek2 MLA: n_kv is always 1 (single key head shared by all query heads).
         let n_kv = if mla_arch {
             1
+        } else if aliceai {
+            // aliceai ships `attention.head_count_kv` as a PER-LAYER array (0 on KDA layers, 2 on
+            // full-attention layers) — `meta_u64` cannot read an array, so take the max (the full
+            // layers' value). The per-layer selectors are preserved in `alice_full_attn` below.
+            g.metadata()
+                .get(&mk("attention.head_count_kv"))
+                .and_then(MetaValue::as_arr)
+                .and_then(|a| a.iter().filter_map(MetaValue::as_u64).max())
+                .map(|v| v as usize)
+                .unwrap_or(n_head)
         } else {
             match meta_u64(g, &mk("attention.head_count_kv")) {
                 Some(value) => positive_model_dimension(&mk("attention.head_count_kv"), value)?,
@@ -1187,6 +1230,7 @@ impl Config {
             || deepseek2
             || deepseek4
             || bailingmoe3
+            || aliceai
         {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
@@ -1209,7 +1253,7 @@ impl Config {
                     true,
                     meta_f64(g, &mk("expert_weights_scale")).unwrap_or(1.0) as f32,
                 )
-            } else if deepseek2 || deepseek4 || bailingmoe3 {
+            } else if deepseek2 || deepseek4 || bailingmoe3 || aliceai {
                 let gating = match expert_gating_func {
                     // 0 = the key is absent, which llama.cpp documents as softmax for the old
                     // V2/V2.5 GGUFs written before `expert_gating_func` existed
@@ -1225,8 +1269,9 @@ impl Config {
                 (
                     gating,
                     expert_weights_norm,
-                    false, // weight-before-FFN: always false for deepseek2
-                    meta_f64(g, &mk("expert_weights_scale")).unwrap_or(0.0) as f32,
+                    false, // weight-before-FFN: always false for deepseek2/aliceai
+                    meta_f64(g, &mk("expert_weights_scale")).unwrap_or(if aliceai { 1.0 } else { 0.0 })
+                        as f32,
                 )
             } else if deepseek {
                 (
@@ -1415,8 +1460,54 @@ impl Config {
                 meta_f64(g, &mk("kda.gate_lower_bound"))
                     .context("bailingmoe3.kda.gate_lower_bound")? as f32,
             )
+        } else if aliceai {
+            // aliceai's KDA head width; its decay is a SOFTPLUS form (no `gate_lower_bound`).
+            (
+                meta_u64(g, &mk("kda.head_dim")).context("aliceai.kda.head_dim")? as usize,
+                0.0,
+            )
         } else {
             (0, 0.0)
+        };
+        // aliceai KDA head count (`ssm.time_step_rank` = the linear attention key/value head count,
+        // 32 on 80B-A3B) — distinct from the full-attention `n_head` (16).
+        let kda_n_head = if aliceai {
+            meta_u64(g, &mk("ssm.time_step_rank")).context("aliceai.ssm.time_step_rank")? as usize
+        } else {
+            0
+        };
+        // aliceai per-layer full-attention selector: the GGUF's `attention.head_count_kv` is an
+        // ARRAY (0 on KDA recurrent layers, 2 on full-attention layers). This array — not a modulo
+        // — is the authoritative per-layer type marker.
+        let alice_full_attn = if aliceai {
+            match g
+                .metadata()
+                .get(&mk("attention.head_count_kv"))
+                .and_then(MetaValue::as_arr)
+            {
+                Some(values) => {
+                    if values.len() < n_layer {
+                        bail!(
+                            "{}.attention.head_count_kv has {} entries for {n_layer} layers",
+                            arch,
+                            values.len()
+                        );
+                    }
+                    values[..n_layer]
+                        .iter()
+                        .map(|v| v.as_u64().map(|n| n > 0).unwrap_or(false))
+                        .collect()
+                }
+                None => bail!("{arch}.attention.head_count_kv must be a per-layer array"),
+            }
+        } else {
+            Vec::new()
+        };
+        // aliceai depth-residual block size (a completed-block residual every `block` layers).
+        let alice_block = if aliceai {
+            meta_u64(g, &mk("attn_res.block_size")).unwrap_or(4) as usize
+        } else {
+            0
         };
         let (ssm_d_conv, ssm_d_state, ssm_d_inner, ssm_n_group, ssm_dt_rank) = if qwen35 || qwen4exp
         {
@@ -1432,6 +1523,15 @@ impl Config {
                 meta_u64(g, &mk("ssm.time_step_rank"))
                     .with_context(|| format!("{arch} ssm.time_step_rank"))?
                     as usize,
+            )
+        } else if aliceai {
+            (
+                meta_u64(g, &mk("ssm.conv_kernel"))
+                    .context("aliceai.ssm.conv_kernel")? as usize,
+                kda_head_dim,
+                kda_n_head * kda_head_dim,
+                kda_n_head,
+                kda_n_head,
             )
         } else if bailingmoe3 {
             (
@@ -1460,7 +1560,7 @@ impl Config {
         } else {
             [0u32; 4]
         };
-        let attn_out_gate = qwen35 || qwen4exp;
+        let attn_out_gate = qwen35 || qwen4exp || aliceai;
         // DeepSeek: first N layers are dense FFN, the rest are MoE.
         let n_layer_dense_lead = if deepseek || deepseek2 || bailingmoe3 {
             meta_u64(g, &mk("leading_dense_block_count")).unwrap_or(0) as usize
@@ -1472,7 +1572,7 @@ impl Config {
         // (`models/llama4.cpp`: `n_ff_shexp = n_ff_exp`). DeepSeek's shared expert is
         // `n_ff_exp * n_expert_shared` wide (llama.cpp fuses `n_expert_shared` experts into one
         // wider branch — see docs/deepseek.md § Stage 1). `0` = no shared expert.
-        let shexp_ff = if qwen35_moe || qwen4exp {
+        let shexp_ff = if qwen35_moe || qwen4exp || aliceai {
             meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize
         } else if llama4 {
             moe.map(|m| m.n_ff_exp).unwrap_or(0)
@@ -1484,7 +1584,7 @@ impl Config {
         };
         // llama4 shared expert is summed in PLAIN (no per-token gate); qwen35moe gates by sigmoid.
         // DeepSeek's shared expert is also plain-summed (no gate).
-        let shexp_gated = qwen35_moe || qwen4exp;
+        let shexp_gated = qwen35_moe || qwen4exp || aliceai;
         // llama4 iRoPE + MoE interleave. `interleave_moe_layer_step` defaults to 1 (every layer MoE,
         // as on Scout). The NoPE step: the reference forces the chunked-attention branch whenever
         // `attention.sliding_window` is absent or nonzero, in which case `n_no_rope_layer_step`
@@ -1855,6 +1955,10 @@ impl Config {
             ssm_dt_rank,
             rope_sections,
             attn_out_gate,
+            aliceai,
+            alice_full_attn,
+            kda_n_head,
+            alice_block,
             n_layer_nextn,
             shexp_ff,
             llama4,

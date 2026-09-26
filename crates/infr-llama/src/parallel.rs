@@ -966,6 +966,15 @@ impl ParallelSeam {
         &self.model
     }
 
+    /// Whether this engine's model is the `aliceai` arch (`general.architecture = "aliceai"`).
+    ///
+    /// Exposed so the CLI's `ChatGenerator` impl can map it to the server's
+    /// `infr_server::aliceai_output_policy` — `infr-llama` does not depend on `infr-server`, so the
+    /// policy TYPE lives there and this is only the flag the CLI bridges.
+    pub fn is_aliceai(&self) -> bool {
+        self.model.config().aliceai
+    }
+
     /// A fresh per-sequence context wired to this engine's baton — one per request.
     pub fn request_ctx(&self, sampling: crate::sampling::RequestSampling) -> RequestCtx {
         match &self.gate {

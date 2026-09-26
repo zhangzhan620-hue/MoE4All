@@ -3397,3 +3397,409 @@ fn gpu_synthetic_deepseek4_mechanisms_execute() {
         "window-1 logits are degenerate (rms {scale:e})"
     );
 }
+
+
+// --- aliceai (Yandex AliceAI-Foundation) -----------------------------------------
+//
+// A structurally complete but tiny aliceai model: period-4 alternating KDA / full-attention
+// layers, per-layer depth-residual softmax mixing (block size 4), zero-centered norms baked to
+// `1 + weight`, a sigmoid MoE with router bias + gated shared expert. It exercises the REAL
+// `wload`/`wpush` lockstep and the REAL emit for the new `Op::AttnResMix` and the KDA softplus
+// decay. See `crates/infr-llama/src/arch.rs`'s `ALICEAI` doc.
+
+struct AliceDims {
+    n_layer: usize,
+    n_embd: usize,
+    n_head: usize,
+    n_kv: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    kda_head_dim: usize,
+    kda_n_head: usize,
+    conv_kernel: usize,
+    block: usize,
+    n_expert: usize,
+    n_used: usize,
+    moe_ff: usize,
+    shexp: usize,
+    vocab: usize,
+}
+
+fn alice_dims() -> AliceDims {
+    AliceDims {
+        n_layer: 8,
+        n_embd: 64,
+        n_head: 2,
+        n_kv: 2,
+        head_dim: 64,
+        rope_dim: 16,
+        kda_head_dim: 32,
+        kda_n_head: 4,
+        conv_kernel: 4,
+        block: 4,
+        n_expert: 8,
+        n_used: 2,
+        moe_ff: 32,
+        shexp: 32,
+        vocab: 128,
+    }
+}
+
+fn alice_model(d: &AliceDims) -> SyntheticModel {
+    let arch = infr_llama::arch::ALICEAI;
+    let u = |k: &str, v: usize| (format!("{arch}.{k}"), Meta::U32(v as u32));
+    let f = |k: &str, v: f32| (format!("{arch}.{k}"), Meta::F32(v));
+    let kv_types: Vec<i32> = (0..d.n_layer)
+        .map(|l| if (l + 1) % 4 == 0 { d.n_kv as i32 } else { 0 })
+        .collect();
+    let mut meta = vec![
+        (
+            "general.architecture".to_string(),
+            Meta::Str(arch.to_string()),
+        ),
+        u("block_count", d.n_layer),
+        u("embedding_length", d.n_embd),
+        u("feed_forward_length", d.shexp),
+        u("attention.head_count", d.n_head),
+        (
+            format!("{arch}.attention.head_count_kv"),
+            Meta::I32Arr(kv_types),
+        ),
+        u("attention.key_length", d.head_dim),
+        u("attention.value_length", d.head_dim),
+        u("context_length", 256),
+        u("rope.dimension_count", d.rope_dim),
+        f("rope.freq_base", 1_000_000.0),
+        f("attention.layer_norm_rms_epsilon", 1e-6),
+        u("expert_count", d.n_expert),
+        u("expert_used_count", d.n_used),
+        u("expert_feed_forward_length", d.moe_ff),
+        u("expert_shared_feed_forward_length", d.shexp),
+        u("expert_gating_func", 2),
+        (format!("{arch}.expert_weights_norm"), Meta::Bool(true)),
+        f("expert_weights_scale", 1.0),
+        u("kda.head_dim", d.kda_head_dim),
+        u("ssm.conv_kernel", d.conv_kernel),
+        u("ssm.time_step_rank", d.kda_n_head),
+        u("attn_res.block_size", d.block),
+        (
+            "tokenizer.ggml.model".to_string(),
+            Meta::Str("gpt2".to_string()),
+        ),
+        (
+            "tokenizer.ggml.tokens".to_string(),
+            Meta::StrArr((0..d.vocab).map(|i| format!("t{i}")).collect()),
+        ),
+        (
+            "tokenizer.ggml.merges".to_string(),
+            Meta::StrArr(Vec::new()),
+        ),
+        ("tokenizer.ggml.eos_token_id".to_string(), Meta::U32(2)),
+    ];
+    meta.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let w = Fill::Rand(0.25);
+    let key_dim = d.kda_n_head * d.kda_head_dim;
+    let value_dim = d.kda_n_head * d.kda_head_dim;
+    let packed = 3 * key_dim;
+    let qrow = d.n_head * d.head_dim;
+    let kvrow = d.n_kv * d.head_dim;
+
+    let mut tensors = vec![
+        TensorSpec::new("token_embd.weight", vec![d.n_embd, d.vocab], w.clone()),
+        TensorSpec::new("output_norm.weight", vec![d.n_embd], Fill::Gain),
+        TensorSpec::new("output_res_score.weight", vec![d.n_embd], w.clone()),
+        TensorSpec::new("output.weight", vec![d.n_embd, d.vocab], w.clone()),
+    ];
+    for l in 0..d.n_layer {
+        let p = |s: &str| format!("blk.{l}.{s}");
+        let full = (l + 1) % 4 == 0;
+        tensors.push(TensorSpec::new(p("attn_norm.weight"), vec![d.n_embd], Fill::Gain));
+        if l > 0 {
+            tensors.push(TensorSpec::new(
+                p("attn_res_score.weight"),
+                vec![d.n_embd],
+                w.clone(),
+            ));
+        }
+        tensors.push(TensorSpec::new(
+            p("ffn_res_score.weight"),
+            vec![d.n_embd],
+            w.clone(),
+        ));
+        if full {
+            tensors.push(TensorSpec::new(p("attn_q.weight"), vec![d.n_embd, 2 * qrow], w.clone()));
+            tensors.push(TensorSpec::new(p("attn_k.weight"), vec![d.n_embd, kvrow], w.clone()));
+            tensors.push(TensorSpec::new(p("attn_v.weight"), vec![d.n_embd, kvrow], w.clone()));
+            tensors.push(TensorSpec::new(p("attn_q_norm.weight"), vec![d.head_dim], Fill::Gain));
+            tensors.push(TensorSpec::new(p("attn_k_norm.weight"), vec![d.head_dim], Fill::Gain));
+            tensors.push(TensorSpec::new(p("attn_output.weight"), vec![qrow, d.n_embd], w.clone()));
+        } else {
+            tensors.push(TensorSpec::new(p("attn_q.weight"), vec![d.n_embd, key_dim], w.clone()));
+            tensors.push(TensorSpec::new(p("attn_k.weight"), vec![d.n_embd, key_dim], w.clone()));
+            tensors.push(TensorSpec::new(p("attn_v.weight"), vec![d.n_embd, value_dim], w.clone()));
+            tensors.push(TensorSpec::new(
+                p("ssm_conv1d.weight"),
+                vec![d.conv_kernel, packed],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("ssm_f_a.weight"),
+                vec![d.n_embd, d.kda_head_dim],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("ssm_f_b.weight"),
+                vec![d.kda_head_dim, key_dim],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("ssm_g_a.weight"),
+                vec![d.n_embd, d.kda_head_dim],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("ssm_g_b.weight"),
+                vec![d.kda_head_dim, value_dim],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("ssm_beta.weight"),
+                vec![d.n_embd, d.kda_n_head],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(p("ssm_a"), vec![d.kda_n_head], Fill::Rand(0.05)));
+            tensors.push(TensorSpec::new(p("ssm_dt.bias"), vec![key_dim], w.clone()));
+            tensors.push(TensorSpec::new(p("ssm_norm.weight"), vec![d.kda_head_dim], Fill::Gain));
+            tensors.push(TensorSpec::new(
+                p("attn_output.weight"),
+                vec![value_dim, d.n_embd],
+                w.clone(),
+            ));
+        }
+        tensors.push(TensorSpec::new(p("ffn_norm.weight"), vec![d.n_embd], Fill::Gain));
+        tensors.push(TensorSpec::new(
+            p("ffn_gate_inp.weight"),
+            vec![d.n_embd, d.n_expert],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_gate_exps.weight"),
+            vec![d.n_embd, d.moe_ff, d.n_expert],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_up_exps.weight"),
+            vec![d.n_embd, d.moe_ff, d.n_expert],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_down_exps.weight"),
+            vec![d.moe_ff, d.n_embd, d.n_expert],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("exp_probs_b.bias"),
+            vec![d.n_expert],
+            Fill::Rand(0.1),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_gate_inp_shexp.weight"),
+            vec![d.n_embd],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_gate_shexp.weight"),
+            vec![d.n_embd, d.shexp],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_up_shexp.weight"),
+            vec![d.n_embd, d.shexp],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_down_shexp.weight"),
+            vec![d.shexp, d.n_embd],
+            w.clone(),
+        ));
+    }
+    SyntheticModel { meta, tensors }
+}
+
+/// The end-to-end claim: the REAL loader (`wload`/`wpush` lockstep, `Config::from_gguf`) and the
+/// REAL emit for the alternating KDA / full-attention layer graph, the depth-residual softmax mix,
+/// and the shared-expert MoE produce finite, non-degenerate logits on the CPU reference backend.
+#[test]
+fn synthetic_aliceai_generates() {
+    let model = alice_model(&alice_dims());
+    let logits = cpu_logits("aliceai-generate", &model);
+    assert!(
+        logits.iter().all(|x| x.is_finite()),
+        "aliceai logits contain non-finite values"
+    );
+    assert!(
+        rms(&logits) > 1e-3,
+        "aliceai logits are degenerate: {logits:?}"
+    );
+}
+
+
+/// **Incremental decode must be coherent.** The strongest check the seam API allows without
+/// touching engine source: greedy-decode K tokens from [`PROMPT`], then TEACHER-FORCE — for every
+/// step `k`, a FRESH `prefill_logits_cpu(PROMPT ++ gen[..k])` must argmax to exactly `gen[k]`.
+///
+/// A fresh prefill is a from-scratch forward; the incremental `generate_cpu_ids` run carries the KV
+/// cache AND (crucially for aliceai) the KDA conv/recurrent state across steps. If the two disagree,
+/// the carried decode-time state is incoherent — exactly the failure that makes a real model loop
+/// on itself. The generated ids are also asserted non-degenerate (not a constant run).
+///
+/// `generate_cpu_ids` passes `req: None`, and `SamplingCfg`'s compile-time default is
+/// `temp == 0.0`, so `Sampler::resolve(None, _)` is GREEDY (no knob needed on this API). Ties are
+/// reported with their logit margin; the argmax is required to match EXACTLY.
+#[test]
+fn synthetic_aliceai_decode_matches_prefill() {
+    const K: usize = 8;
+    let model = alice_model(&alice_dims());
+    let tmp = TempGguf::write("aliceai-decode-matches-prefill", &model);
+    let sm = load(&tmp);
+
+    let gen = sm
+        .generate_cpu_ids(PROMPT, K, |_| {})
+        .expect("aliceai generate_cpu_ids");
+    println!(
+        "aliceai decode ({K} requested) produced {} ids: {gen:?}",
+        gen.len()
+    );
+    assert!(!gen.is_empty(), "aliceai decoded no tokens");
+    if gen.len() >= 2 {
+        assert!(
+            gen.iter().any(|&t| t != gen[0]),
+            "aliceai decode is degenerate (constant token {}): {gen:?} — the repetition-loop bug",
+            gen[0]
+        );
+    }
+
+    println!("step | incremental | fresh_argmax | top logit | runner-up | margin");
+    let mut mismatches: Vec<usize> = Vec::new();
+    for (k, &want) in gen.iter().enumerate() {
+        let mut seq: Vec<u32> = PROMPT.to_vec();
+        seq.extend_from_slice(&gen[..k]);
+        let fresh = sm
+            .prefill_logits_cpu(&seq)
+            .unwrap_or_else(|e| panic!("fresh prefill of {seq:?} failed: {e}"));
+
+        let mut order: Vec<usize> = (0..fresh.len()).collect();
+        order.sort_by(|&a, &b| fresh[b].total_cmp(&fresh[a]));
+        let (a1, a2) = (order[0], order[1]);
+        let margin = fresh[a1] - fresh[a2];
+        println!(
+            "{k:>4} | {want:>11} | {a1:>12} | {:>9.5} | {:>9.5} | {margin:>9.2e}",
+            fresh[a1], fresh[a2]
+        );
+        if a1 as u32 != want {
+            mismatches.push(k);
+        }
+    }
+
+    assert!(
+        mismatches.is_empty(),
+        "incremental aliceai decode diverged from a fresh prefill at step(s) {mismatches:?}: the \
+         generated token differs from the argmax of a from-scratch prefill of the same prefix, so \
+         the carried decode-time KV/KDA state is incoherent. gen = {gen:?}"
+    );
+}
+
+/// [`synthetic_aliceai_decode_matches_prefill`]'s Vulkan twin: incremental `generate_vulkan_ids`
+/// teacher-forced against fresh `prefill_logits_vulkan` of the same prefix. The Vulkan decode path
+/// is where the record-once chained decode and the f16 KV/recurrent staging live, so a CPU-clean
+/// result does not imply this one. Ignored by default (needs a Vulkan device).
+#[test]
+#[ignore = "needs a Vulkan device; run with --include-ignored"]
+fn synthetic_aliceai_vulkan_decode_matches_prefill() {
+    let _serial = gpu_serial_lock();
+    const K: usize = 8;
+    let model = alice_model(&alice_dims());
+    let tmp = TempGguf::write("aliceai-vulkan-decode-matches-prefill", &model);
+    let sm = load(&tmp);
+
+    let gen = sm
+        .generate_vulkan_ids(PROMPT, K, |_| {})
+        .expect("aliceai generate_vulkan_ids");
+    println!(
+        "aliceai vulkan decode ({K} requested) produced {} ids: {gen:?}",
+        gen.len()
+    );
+    assert!(!gen.is_empty(), "aliceai vulkan decoded no tokens");
+    if gen.len() >= 2 {
+        assert!(
+            gen.iter().any(|&t| t != gen[0]),
+            "aliceai vulkan decode is degenerate (constant token {}): {gen:?}",
+            gen[0]
+        );
+    }
+
+    println!("step | incremental | fresh_argmax | top logit | runner-up | margin");
+    let mut mismatches: Vec<usize> = Vec::new();
+    for (k, &want) in gen.iter().enumerate() {
+        let mut seq: Vec<u32> = PROMPT.to_vec();
+        seq.extend_from_slice(&gen[..k]);
+        let fresh = sm
+            .prefill_logits_vulkan(&seq)
+            .unwrap_or_else(|e| panic!("fresh vulkan prefill of {seq:?} failed: {e}"));
+        let mut order: Vec<usize> = (0..fresh.len()).collect();
+        order.sort_by(|&a, &b| fresh[b].total_cmp(&fresh[a]));
+        let (a1, a2) = (order[0], order[1]);
+        println!(
+            "{k:>4} | {want:>11} | {a1:>12} | {:>9.5} | {:>9.5} | {:>9.2e}",
+            fresh[a1],
+            fresh[a2],
+            fresh[a1] - fresh[a2]
+        );
+        if a1 as u32 != want {
+            mismatches.push(k);
+        }
+    }
+
+    assert!(
+        mismatches.is_empty(),
+        "incremental aliceai VULKAN decode diverged from a fresh prefill at step(s) {mismatches:?}: \
+         the carried decode-time KV/KDA state is incoherent on the GPU path. gen = {gen:?}"
+    );
+}
+
+/// [`synthetic_aliceai_generates`]'s Vulkan twin: exercises the new `attn_res_mix` and the KDA
+/// softplus decay shader paths. Ignored by default (needs a Vulkan device).
+#[test]
+#[ignore = "needs a Vulkan device; run with --include-ignored"]
+fn synthetic_aliceai_vulkan_generates() {
+    let _serial = gpu_serial_lock();
+    let model = alice_model(&alice_dims());
+    let cpu = cpu_logits("aliceai-parity-cpu", &model);
+    let logits = vulkan_logits("aliceai-vulkan", &model);
+    assert!(
+        logits.iter().all(|x| x.is_finite()),
+        "aliceai Vulkan logits contain non-finite values"
+    );
+    assert!(
+        rms(&logits) > 1e-3,
+        "aliceai Vulkan logits are degenerate: {logits:?}"
+    );
+    let cos = cosine(&cpu, &logits);
+    println!(
+        "synthetic aliceai cpu-vs-vulkan cosine = {cos} (argmax {}/{})",
+        argmax(&cpu),
+        argmax(&logits)
+    );
+    assert_eq!(
+        argmax(&cpu),
+        argmax(&logits),
+        "CPU and Vulkan disagree on the top token"
+    );
+    // 8 layers of KDA recurrence + f16 KV staging, so a looser bound than the deepseek2 twin's
+    // 0.9999; a mis-computed depth-residual softmax or softplus decay would fall far below this.
+    assert!(
+        cos > 0.99,
+        "CPU/Vulkan logits diverged on the synthetic aliceai model: cosine = {cos}"
+    );
+}

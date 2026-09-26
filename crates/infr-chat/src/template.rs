@@ -2,6 +2,7 @@
 //! embedded `tokenizer.chat_template` (a Jinja2 string). The single source of truth — every prompt
 //! path funnels through [`render_chat_jinja`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -347,6 +348,28 @@ fn message_to_json(m: &ChatMessage) -> Value {
     Value::Object(obj)
 }
 
+/// Resolve the chat template source for a render: an external Jinja file named by the
+/// `INFR_CHAT_TEMPLATE_FILE` environment variable WINS over the GGUF's embedded
+/// `tokenizer.chat_template`.
+///
+/// Base models (e.g. AliceAI-Foundation-80B-A3B-Base) ship no embedded template at all, so
+/// [`render_core`] would otherwise fail with [`TemplateError::NoTemplate`]; pointing the variable
+/// at a `.jinja` file lets the engine render chats for those models without rewriting the GGUF. A
+/// missing, unreadable, or whitespace-only file silently falls back to the embedded template
+/// (which may itself be absent, yielding [`TemplateError::NoTemplate`]).
+fn resolve_chat_template(embedded: Option<&str>) -> Result<Cow<'_, str>, TemplateError> {
+    if let Some(external) = std::env::var("INFR_CHAT_TEMPLATE_FILE")
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Ok(Cow::Owned(external));
+    }
+    embedded
+        .map(Cow::Borrowed)
+        .ok_or(TemplateError::NoTemplate)
+}
+
 /// Core renderer over a GGUF: pull the template + bos/eos out of the metadata, then delegate to
 /// [`render_template`]. Shared by every entry point so template handling lives in ONE place.
 #[allow(clippy::too_many_arguments)]
@@ -360,10 +383,7 @@ fn render_core(
     cfg: &Config,
     options: &ChatTemplateOptions,
 ) -> Result<String, TemplateError> {
-    let template = gguf
-        .metadata()
-        .str("tokenizer.chat_template")
-        .ok_or(TemplateError::NoTemplate)?;
+    let template = resolve_chat_template(gguf.metadata().str("tokenizer.chat_template"))?;
     // BOS: use the metadata id if present, else fall back to the tokenizer's own BOS token — never
     // a hardcoded id (the old `2` default is EOS for Llama-family GGUFs, so a missing-metadata
     // model would inject the EOS string at the prompt head).
@@ -380,7 +400,7 @@ fn render_core(
     // default is (Qwen3.5 defaults itself OFF via `enable_thinking is defined and is true`).
     let options = options.resolve(cfg);
     match render_template_with_options(
-        template,
+        &template,
         msgs,
         tools,
         &bos,
@@ -665,5 +685,44 @@ mod template_tests {
         .unwrap();
         assert_eq!(on, "think=true");
         assert_eq!(off, "think=false");
+    }
+
+    /// `INFR_CHAT_TEMPLATE_FILE` is the env override that lets a BASE model (no embedded
+    /// `tokenizer.chat_template` — `embedded == None`) render at all: the external file's template
+    /// wins and its output is the rendered prompt, not [`TemplateError::NoTemplate`]. Also pins the
+    /// two fallbacks the override must not break: no env var + no embedded template still errors,
+    /// and an embedded template is used untouched. Serialized on a process-global mutex because the
+    /// environment is process-wide; the variable is removed before the guard is released.
+    #[test]
+    fn external_template_file_overrides_embedded() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        const EXTERNAL: &str =
+            "{% for m in messages %}{{ m.role }}-EXT: {{ m.content }}\n{% endfor %}";
+        let path =
+            std::env::temp_dir().join(format!("infr-chat-ext-{}.jinja", std::process::id()));
+        std::fs::write(&path, EXTERNAL).expect("write external template fixture");
+
+        std::env::set_var("INFR_CHAT_TEMPLATE_FILE", &path);
+        // A base model is exactly `embedded == None` — the override must supply the template.
+        let resolved = resolve_chat_template(None).expect("env override must supply a template");
+        assert!(matches!(&resolved, Cow::Owned(_)), "external file is owned");
+        let out = render_template(&resolved, msgs(), Value::Null, "<s>", "</s>", true, true)
+            .expect("external template renders");
+        assert_eq!(out, "user-EXT: hi\nassistant-EXT: yo\n");
+
+        // Without the override, a template-less model still fails with NoTemplate…
+        std::env::remove_var("INFR_CHAT_TEMPLATE_FILE");
+        assert!(matches!(
+            resolve_chat_template(None),
+            Err(TemplateError::NoTemplate)
+        ));
+        // …and an embedded template is used untouched (no override, borrowed).
+        let embedded = resolve_chat_template(Some(TMPL)).expect("embedded template is used");
+        assert!(matches!(&embedded, Cow::Borrowed(_)));
+        assert_eq!(embedded.as_ref(), TMPL);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
